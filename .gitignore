@@ -1,0 +1,7 @@
+config/.env
+tokens.json
+*.json
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
