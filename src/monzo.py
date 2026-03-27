@@ -95,31 +95,3 @@ def get_balance(access_token: str) -> float:
     return round(pence / 100, 2)
 
 
-def make_payment(access_token: str, amount_pence: int, reference: str) -> dict:
-    """
-    Send a bank transfer to the payee defined in .env.
-    amount_pence must be a positive integer.
-    Returns the API response dict.
-    """
-    if amount_pence <= 0:
-        raise ValueError(f"Payment amount must be positive, got {amount_pence}")
-
-    account_id = _get_account_id(access_token)
-
-    resp = requests.post(
-        f"{MONZO_API}/payments/",
-        headers={"Authorization": f"Bearer {access_token}"},
-        data={
-            "account_id": account_id,
-            "amount": amount_pence,
-            "currency": "GBP",
-            "description": reference,
-            "destination[account_number]": os.environ["MONZO_PAYEE_ACCOUNT_NUMBER"],
-            "destination[sort_code]": os.environ["MONZO_PAYEE_SORT_CODE"],
-            "destination[account_type]": "uk_retail",
-        },
-        timeout=30,
-    )
-    if not resp.ok:
-        raise RuntimeError(f"Monzo payment failed: {resp.status_code} {resp.text}")
-    return resp.json()
