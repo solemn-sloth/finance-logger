@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import monzo
 import t212
 import wise
+import kraken
 import sheets
 
 
@@ -34,8 +35,9 @@ def main():
     monzo_cell = os.environ["GOOGLE_MONZO_CELL"]
     t212_isa_cell = os.environ["GOOGLE_T212_ISA_CELL"]
     t212_invest_value_cell = os.environ["GOOGLE_T212_INVEST_VALUE_CELL"]
-    t212_invest_profit_cell = os.environ["GOOGLE_T212_INVEST_PROFIT_CELL"]
+    t212_isa_deposits_cell = os.environ["GOOGLE_T212_ISA_DEPOSITS_CELL"]
     wise_cell = os.environ["GOOGLE_WISE_CELL"]
+    kraken_cell = os.environ["GOOGLE_KRAKEN_CELL"]
     today = date.today().isoformat()
 
     print(f"[{today}] Starting daily snapshot...")
@@ -51,12 +53,12 @@ def main():
     # 2. Trading 212 — ISA snapshot
     print("  Fetching T212 ISA portfolio...")
     isa = t212.get_portfolio()
-    print(f"  T212 ISA value: £{isa['value']}  profit: {isa['profit_pct']}%")
+    print(f"  T212 ISA value: £{isa['value']}")
 
     # 3. Trading 212 — Invest snapshot
     print("  Fetching T212 Invest portfolio...")
     invest = t212.get_invest_portfolio()
-    print(f"  T212 Invest value: £{invest['value']}  profit: £{invest['profit_abs']}")
+    print(f"  T212 Invest value: £{invest['value']}")
 
     # 4. Write to Sheets
     print(f"  Writing Monzo balance to {tab}!{monzo_cell}...")
@@ -65,11 +67,11 @@ def main():
     print(f"  Writing T212 ISA value to {tab}!{t212_isa_cell}...")
     sheets.update_cell(sheet_id, tab, t212_isa_cell, isa["value"])
 
+    print(f"  Writing T212 ISA deposits to {tab}!{t212_isa_deposits_cell}...")
+    sheets.update_cell(sheet_id, tab, t212_isa_deposits_cell, isa["total_cost"])
+
     print(f"  Writing T212 Invest value to {tab}!{t212_invest_value_cell}...")
     sheets.update_cell(sheet_id, tab, t212_invest_value_cell, invest["value"])
-
-    print(f"  Writing T212 Invest profit to {tab}!{t212_invest_profit_cell}...")
-    sheets.update_cell(sheet_id, tab, t212_invest_profit_cell, invest["profit_abs"])
 
     # 5. Wise — GBP balance
     print("  Fetching Wise GBP balance...")
@@ -78,6 +80,14 @@ def main():
 
     print(f"  Writing Wise balance to {tab}!{wise_cell}...")
     sheets.update_cell(sheet_id, tab, wise_cell, wise_balance)
+
+    # 6. Kraken — total GBP equivalent balance
+    print("  Fetching Kraken total balance...")
+    kraken_balance = kraken.get_total_balance()
+    print(f"  Kraken balance: £{kraken_balance}")
+
+    print(f"  Writing Kraken balance to {tab}!{kraken_cell}...")
+    sheets.update_cell(sheet_id, tab, kraken_cell, kraken_balance)
 
     print(f"[{today}] Done.")
 

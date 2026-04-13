@@ -33,9 +33,9 @@ def _fetch_summary(auth: HTTPBasicAuth) -> dict:
     inv = resp.json()["investments"]
     value = round(float(inv["currentValue"]), 2)
     profit_abs = round(float(inv["unrealizedProfitLoss"]), 2)
-    cost = float(inv["totalCost"])
+    cost = round(float(inv["totalCost"]), 2)
     profit_pct = round((profit_abs / cost * 100) if cost else 0.0, 4)
-    return {"value": value, "profit_abs": profit_abs, "profit_pct": profit_pct}
+    return {"value": value, "profit_abs": profit_abs, "profit_pct": profit_pct, "total_cost": cost}
 
 
 def get_portfolio() -> dict:
