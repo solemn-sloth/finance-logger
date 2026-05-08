@@ -26,6 +26,7 @@ import monzo
 import t212
 import wise
 import kraken
+import barclaycard
 import sheets
 
 
@@ -36,8 +37,9 @@ def main():
     t212_isa_cell = os.environ["GOOGLE_T212_ISA_CELL"]
     t212_invest_value_cell = os.environ["GOOGLE_T212_INVEST_VALUE_CELL"]
     t212_isa_deposits_cell = os.environ["GOOGLE_T212_ISA_DEPOSITS_CELL"]
-    wise_cell = os.environ["GOOGLE_WISE_CELL"]
+    isa_carryover = float(os.environ.get("T212_ISA_CARRYOVER", "0"))
     kraken_cell = os.environ["GOOGLE_KRAKEN_CELL"]
+    barclaycard_cell = os.environ["GOOGLE_BARCLAYCARD_CELL"]
     today = date.today().isoformat()
 
     print(f"[{today}] Starting daily snapshot...")
@@ -67,19 +69,17 @@ def main():
     print(f"  Writing T212 ISA value to {tab}!{t212_isa_cell}...")
     sheets.update_cell(sheet_id, tab, t212_isa_cell, isa["value"])
 
-    print(f"  Writing T212 ISA deposits to {tab}!{t212_isa_deposits_cell}...")
-    sheets.update_cell(sheet_id, tab, t212_isa_deposits_cell, isa["total_cost"])
+    isa_deposits = round(isa["total_cost"] - isa_carryover, 2)
+    print(f"  Writing T212 ISA deposits to {tab}!{t212_isa_deposits_cell} "
+          f"(total_cost £{isa['total_cost']} − carryover £{isa_carryover} = £{isa_deposits})...")
+    sheets.update_cell(sheet_id, tab, t212_isa_deposits_cell, isa_deposits)
 
     print(f"  Writing T212 Invest value to {tab}!{t212_invest_value_cell}...")
     sheets.update_cell(sheet_id, tab, t212_invest_value_cell, invest["value"])
 
-    # 5. Wise — GBP balance
-    print("  Fetching Wise GBP balance...")
-    wise_balance = wise.get_balance()
-    print(f"  Wise balance: £{wise_balance}")
-
-    print(f"  Writing Wise balance to {tab}!{wise_cell}...")
-    sheets.update_cell(sheet_id, tab, wise_cell, wise_balance)
+    # 5. Wise — skipped (no longer using Wise; E6 holds cash balance manually)
+    # wise_balance = wise.get_balance()
+    # sheets.update_cell(sheet_id, tab, wise_cell, wise_balance)
 
     # 6. Kraken — total GBP equivalent balance
     print("  Fetching Kraken total balance...")
@@ -88,6 +88,16 @@ def main():
 
     print(f"  Writing Kraken balance to {tab}!{kraken_cell}...")
     sheets.update_cell(sheet_id, tab, kraken_cell, kraken_balance)
+
+    # 7. Barclaycard — outstanding balance from forwarded email
+    try:
+        print("  Fetching Barclaycard balance...")
+        barclaycard_balance = barclaycard.get_balance()
+        print(f"  Barclaycard balance: £{barclaycard_balance}")
+        print(f"  Writing Barclaycard balance to {tab}!{barclaycard_cell}...")
+        sheets.update_cell(sheet_id, tab, barclaycard_cell, barclaycard_balance)
+    except Exception as e:
+        print(f"  Barclaycard step skipped: {e}", file=sys.stderr)
 
     print(f"[{today}] Done.")
 
