@@ -1,4 +1,4 @@
-# Finance Automations — cron entries
+# finance-logger — cron entries
 #
 # To install:
 #   1. sudo mkdir -p /var/log/finance && sudo chown $USER /var/log/finance
@@ -9,4 +9,4 @@
 #   tail -f /var/log/finance/daily.log
 
 # Daily snapshot — 8am every day
-0 8 * * * /usr/bin/python3 "/home/root/Finance Automations/src/daily_snapshot.py" >> /var/log/finance/daily.log 2>&1
+0 8 * * * /usr/bin/python3 "/home/root/finance-logger/src/daily_snapshot.py" >> /var/log/finance/daily.log 2>&1

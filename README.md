@@ -1,4 +1,4 @@
-# Finance Logging Automation
+# finance-logger
 
 Daily snapshot job that pulls balances from personal finance accounts and writes them to a Google Sheet.
 
