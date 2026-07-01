@@ -178,7 +178,7 @@ def main():
         if today_date.day == 1:
             nw_str = sheets.read_cell(sheet_id, tab, "E18")
             try:
-                nw = round(float(str(nw_str).replace(",", "")), 2)
+                nw = round(float(str(nw_str).replace(",", "").replace("£", "")), 2)
             except (ValueError, TypeError):
                 nw = 0.0
             if nw > 0:
