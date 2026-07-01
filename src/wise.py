@@ -3,6 +3,8 @@ Wise API client.
 
 Handles GBP balance fetching.
 Auth: static personal API token (no rotation needed).
+Note: Wise statement/transaction endpoints are blocked for personal accounts
+under PSD2 — only balance fetching is supported.
 """
 
 import os
@@ -36,5 +38,3 @@ def get_balance() -> float:
         if b.get("amount", {}).get("currency") == "GBP":
             return float(b["amount"]["value"])
     raise RuntimeError("No GBP balance found in Wise account")
-
-

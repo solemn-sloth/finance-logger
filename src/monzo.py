@@ -95,3 +95,27 @@ def get_balance(access_token: str) -> float:
     return round(pence / 100, 2)
 
 
+def get_transactions(access_token: str, since: str, before: str) -> list[dict]:
+    """Return transactions for the given window.
+
+    since/before: ISO 8601, e.g. "2025-07-01T00:00:00Z"
+    amount is in pence (negative=debit, positive=credit).
+    Requires 'transactions' scope on the OAuth client.
+    """
+    account_id = _get_account_id(access_token)
+    resp = requests.get(
+        f"{MONZO_API}/transactions",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "account_id": account_id,
+            "since": since,
+            "before": before,
+            "expand[]": "merchant",
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Monzo transactions fetch failed: {resp.status_code} {resp.text}")
+    return resp.json().get("transactions", [])
+
+
