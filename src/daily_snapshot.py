@@ -176,15 +176,16 @@ def main():
         _upsert_pnl_row(sheet_id, tab, month_label, pnl)
 
         if today_date.day == 1:
-            nw = round(
-                balance + isa["value"] + invest["value"] + kraken_balance - barclaycard_balance,
-                2,
-            )
+            nw_str = sheets.read_cell(sheet_id, tab, "E18")
+            try:
+                nw = round(float(str(nw_str).replace(",", "")), 2)
+            except (ValueError, TypeError):
+                nw = 0.0
             if nw > 0:
-                print(f"  Net worth on {today_date}: £{nw} — appending to history...")
+                print(f"  Net worth on {today_date}: £{nw} (from E18) — appending to history...")
                 _append_networth_row(sheet_id, tab, today_date.isoformat(), nw)
             else:
-                print(f"  Net worth sanity check failed (£{nw}), skipping.", file=sys.stderr)
+                print(f"  Net worth sanity check failed (E18={nw_str!r}), skipping.", file=sys.stderr)
     except Exception as e:
         print(f"  P&L / net worth step failed: {e}", file=sys.stderr)
 
