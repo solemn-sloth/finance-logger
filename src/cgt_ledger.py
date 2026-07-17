@@ -14,6 +14,7 @@ Input columns are never rewritten, so manual rows always survive.
 Usage:
   python3 src/cgt_ledger.py                 # sync from APIs + recompute
   python3 src/cgt_ledger.py --setup         # one-time: create tab, headers, formats
+  python3 src/cgt_ledger.py --migrate       # one-time: apply new formatting to an existing tab
   python3 src/cgt_ledger.py --dry-run       # print what would change, write nothing
   python3 src/cgt_ledger.py --recompute-only  # skip APIs, recompute existing rows
   python3 src/cgt_ledger.py --sort          # also physically re-sort rows by date
@@ -25,6 +26,17 @@ Manual row conventions:
   - RSU vest: Type REWARD, Asset In/Qty In, Value = market value at vest,
     Income Taxed = amount already taxed through payroll (becomes cost basis).
   - Any manual Txn ID must be unique, prefix MANUAL: recommended.
+
+Reconciliation: each run compares actual T212/Kraken holdings against what
+the ledger's Section 104 pools account for. Any asset held in real life but
+under-explained by the ledger gets a stub OPENING row appended with Txn ID
+MANUAL:NEEDS-INPUT-<ASSET> — Value is left blank on purpose so it's flagged
+(⚠ MISSING VALUE) and highlighted (see --migrate) until you fill in the real
+cost basis and, if needed, correct the date. This is a point-in-time snapshot:
+once appended, the row is yours — later runs never edit or re-check it.
+The reverse case (ledger tracks more than you actually hold) is never
+auto-written — it may be an untaxable transfer to self-custody rather than
+a disposal — only a console warning is printed.
 """
 
 import argparse
@@ -48,7 +60,7 @@ LONDON = ZoneInfo("Europe/London")
 UTC = timezone.utc
 
 HEADERS = [
-    "Date (UTC)", "Type", "Asset Out", "Qty Out", "Asset In", "Qty In",
+    "Date", "Type", "Asset Out", "Qty Out", "Asset In", "Qty In",
     "Value (GBP)", "Valuation Method", "Fee (GBP)", "Fee (orig)", "Wallet",
     "Txn ID", "Income Taxed (GBP)", "Notes",
     "Match Rule", "Pool Units Before", "Pool Cost Before (GBP)",
@@ -59,6 +71,8 @@ N_COLS = 20         # A-T
 
 ANNUAL_EXEMPT_AMOUNT = Decimal("3000")
 PROCEEDS_REPORTING_THRESHOLD = Decimal("50000")
+RECONCILE_TOLERANCE = Decimal("0.000001")
+WARNING_MARK = "⚠ "
 
 DISPOSAL_TYPES = {"SELL", "SWAP"}
 ACQUISITION_TYPES = {"BUY", "SWAP", "REWARD", "OPENING"}
@@ -82,7 +96,7 @@ def _dec(value, default=None) -> Decimal | None:
 
 _DATE_FORMATS = [
     "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y", "%d/%m/%y",
 ]
 
 
@@ -108,6 +122,14 @@ def parse_dt(value: str) -> datetime:
 
 def iso(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def date_str(dt: datetime) -> str:
+    """Calendar date (Europe/London) as unambiguous ISO YYYY-MM-DD, for column A.
+    Written USER_ENTERED so Sheets stores it as a real Date type; the column's
+    number format (see sheets.format_column_number_format) then displays it
+    as dd/mm/yy with no time."""
+    return dt.astimezone(LONDON).date().isoformat()
 
 
 def _num(dec: Decimal | None, places: int = 2):
@@ -169,7 +191,7 @@ def parse_row(idx: int, cells: list) -> Row | None:
 
 def row_to_cells(r: Row) -> list:
     return [
-        iso(r.dt), r.type, r.asset_out, _num(r.qty_out, 8), r.asset_in,
+        date_str(r.dt) if r.dt else "", r.type, r.asset_out, _num(r.qty_out, 8), r.asset_in,
         _num(r.qty_in, 8), _num(r.value_gbp), r.method, _num(r.fee_gbp),
         r.fee_orig, r.wallet, r.txid, _num(r.income_taxed), r.notes,
     ]
@@ -255,19 +277,37 @@ def _events(rows: list[Row]) -> tuple[list[_Acq], list[_Disp]]:
             if not r.asset_in or not r.qty_in:
                 r.warning = "MISSING ASSET/QTY IN"
                 continue
-            cost = value + fee if r.type == "BUY" else (
-                r.income_taxed if (r.type == "REWARD" and r.income_taxed) else value
-            )
+            if r.type == "BUY":
+                if r.value_gbp is None:
+                    r.warning = "MISSING VALUE"
+                    continue
+                cost = value + fee
+            elif r.type == "REWARD":
+                if r.value_gbp is None and r.income_taxed is None:
+                    r.warning = "MISSING VALUE"
+                    continue
+                cost = r.income_taxed if r.income_taxed is not None else value
+            else:  # OPENING
+                if r.value_gbp is None:
+                    r.warning = "MISSING VALUE"
+                    continue
+                cost = value
             acqs.append(_Acq(r, r.asset_in, r.dt, r.qty_in, cost,
                              opening=(r.type == "OPENING")))
         elif r.type == "SELL":
             if not r.asset_out or not r.qty_out:
                 r.warning = "MISSING ASSET/QTY OUT"
                 continue
+            if r.value_gbp is None:
+                r.warning = "MISSING VALUE"
+                continue
             disps.append(_Disp(r, r.asset_out, r.dt, r.qty_out, value - fee))
         elif r.type == "SWAP":
             if not r.asset_out or not r.qty_out or not r.asset_in or not r.qty_in:
                 r.warning = "SWAP NEEDS BOTH SIDES"
+                continue
+            if r.value_gbp is None:
+                r.warning = "MISSING VALUE"
                 continue
             disps.append(_Disp(r, r.asset_out, r.dt, r.qty_out, value - fee))
             acqs.append(_Acq(r, r.asset_in, r.dt, r.qty_in, value))
@@ -275,10 +315,18 @@ def _events(rows: list[Row]) -> tuple[list[_Acq], list[_Disp]]:
     return acqs, disps
 
 
-def compute_cgt(rows: list[Row]) -> dict[int, Computed]:
-    """Run UK share matching over all rows; returns computed values keyed by row idx."""
+def compute_cgt(
+    rows: list[Row],
+) -> tuple[dict[int, Computed], dict[str, tuple[Decimal, Decimal]]]:
+    """
+    Run UK share matching over all rows.
+
+    Returns (computed values keyed by row idx, final Section 104 pool
+    (units, cost) per asset after all matching).
+    """
     acqs, disps = _events(rows)
     out: dict[int, Computed] = {r.idx: Computed() for r in rows}
+    asset_pools: dict[str, tuple[Decimal, Decimal]] = {}
 
     assets = sorted({a.asset for a in acqs} | {d.asset for d in disps})
     for asset in assets:
@@ -348,10 +396,12 @@ def compute_cgt(rows: list[Row]) -> dict[int, Computed]:
             if comp.pool_before is None or kind == 1:
                 comp.pool_before, comp.pool_after = before, after
 
+        asset_pools[asset] = (pool_u, pool_c)
+
         for d in d_list:
             comp = out[d.row.idx]
             comp.gain = d.gain
-            comp.match = d.rule
+            comp.match = (WARNING_MARK if "SHORTFALL" in d.rule else "") + d.rule
         for a in a_list:
             comp = out[a.row.idx]
             if a.matched and not comp.match:
@@ -361,8 +411,8 @@ def compute_cgt(rows: list[Row]) -> dict[int, Computed]:
 
     for r in rows:
         if r.warning:
-            out[r.idx].match = f"⚠ {r.warning}"
-    return out
+            out[r.idx].match = f"{WARNING_MARK}{r.warning}"
+    return out, asset_pools
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +529,81 @@ def fetch_kraken_rows(since: datetime) -> list[Row]:
 
 
 # ---------------------------------------------------------------------------
+# Holdings reconciliation — compares real T212/Kraken balances against what
+# the ledger's Section 104 pools account for, and flags gaps.
+# ---------------------------------------------------------------------------
+
+def fetch_current_holdings() -> dict[str, tuple[Decimal, str]]:
+    """asset -> (quantity actually held, wallet). Each source fetched
+    independently so one API outage doesn't block the other."""
+    holdings: dict[str, tuple[Decimal, str]] = {}
+    try:
+        import kraken
+
+        for asset, qty in kraken.get_balances().items():
+            holdings[asset] = (qty, "Kraken")
+    except Exception as exc:
+        print(f"WARN: Kraken balance fetch failed, skipping reconciliation for crypto: {exc}",
+              file=sys.stderr)
+    try:
+        import t212
+
+        for pos in t212.get_invest_positions():
+            qty = _dec(pos.get("quantity"), Decimal(0))
+            if qty > Decimal("0.00000001"):
+                holdings[pos["ticker"]] = (qty, "T212-Invest")
+    except Exception as exc:
+        print(f"WARN: T212 positions fetch failed, skipping reconciliation for GIA: {exc}",
+              file=sys.stderr)
+    return holdings
+
+
+def reconcile_holdings(
+    rows: list[Row], asset_pools: dict[str, tuple[Decimal, Decimal]],
+    holdings: dict[str, tuple[Decimal, str]], ty_start: date,
+) -> list[Row]:
+    """
+    Stub OPENING rows for assets held in real life but under-explained by the
+    ledger's Section 104 pools. Value is left blank so the row is flagged
+    (⚠ MISSING VALUE) until the user fills in the real cost basis. Never
+    auto-writes the reverse case (ledger tracks MORE than actually held) —
+    that could be an untaxable transfer to self-custody, not a disposal —
+    it's only printed as a console warning.
+    """
+    known_txids = {r.txid for r in rows if r.txid}
+    stub_dt = datetime(ty_start.year, ty_start.month, ty_start.day, tzinfo=UTC) - timedelta(days=1)
+    stubs = []
+    for asset, (actual_qty, wallet) in sorted(holdings.items()):
+        tracked_qty = asset_pools.get(asset, (Decimal(0), Decimal(0)))[0]
+        diff = actual_qty - tracked_qty
+        if diff > RECONCILE_TOLERANCE:
+            txid = f"MANUAL:NEEDS-INPUT-{asset}"
+            if txid in known_txids:
+                continue
+            stubs.append(Row(
+                idx=0, dt=stub_dt, type="OPENING",
+                asset_out="", qty_out=None, asset_in=asset, qty_in=diff,
+                value_gbp=None, method="",
+                fee_gbp=None, fee_orig="", wallet=wallet, txid=txid,
+                income_taxed=None,
+                notes=(f"Auto-flagged: {wallet} shows {actual_qty.normalize():f} {asset} but "
+                       f"the ledger only accounts for {tracked_qty.normalize():f}. Fill in "
+                       f"Value (GBP) with the cost basis for the missing {diff.normalize():f} "
+                       f"units, and correct the date above if this wasn't all acquired before "
+                       f"the tax year start."),
+            ))
+        elif diff < -RECONCILE_TOLERANCE:
+            print(
+                f"WARN: {asset} tracked pool ({tracked_qty.normalize():f}) exceeds actual "
+                f"{wallet} balance ({actual_qty.normalize():f}) by {(-diff).normalize():f} — "
+                f"check for an un-logged disposal, gift, or off-platform transfer. If moved "
+                f"to self-custody, no ledger action needed; if sold/spent/gifted, add a "
+                f"manual SELL row.", file=sys.stderr,
+            )
+    return stubs
+
+
+# ---------------------------------------------------------------------------
 # Sheet I/O
 # ---------------------------------------------------------------------------
 
@@ -509,6 +634,33 @@ def write_computed(sheet_id: str, tab: str, rows: list[Row],
             _num(c.gain),
         ]
     sheets.write_range(sheet_id, tab, f"O2:T{last}", block)
+
+
+def write_dates(sheet_id: str, tab: str, rows: list[Row]) -> None:
+    """
+    Normalize column A's representation to a real Sheets Date (see date_str),
+    for every row with a valid dt. This is a deliberate, narrow exception to
+    "input columns are never rewritten": it only changes how a date displays,
+    never what date a row represents. Rows with a BAD DATE warning are left
+    untouched — never overwrite unparseable text the user needs to fix by hand.
+
+    Also reapplies the dd/mm/yy number format on every run: rows appended via
+    INSERT_ROWS don't inherit formatting set on the column by --setup/--migrate
+    (they're new grid rows), so without this they'd fall back to Sheets'
+    auto-inferred yyyy-mm-dd format. repeatCell formatting is idempotent —
+    safe to reapply every run (unlike the conditional-format rule).
+    """
+    if not rows:
+        return
+    last = max(r.idx for r in rows)
+    block = [[""] for _ in range(last - 1)]
+    for r in rows:
+        if r.dt is not None and "BAD DATE" not in r.warning:
+            block[r.idx - 2] = [date_str(r.dt)]
+        elif r.raw:
+            block[r.idx - 2] = [r.raw[0]]  # unparseable: leave the user's text untouched
+    sheets.write_range(sheet_id, tab, f"A2:A{last}", block, raw=False)
+    sheets.format_column_number_format(sheet_id, tab, 0, 1, "dd/mm/yy")
 
 
 def tax_year_window(start: date) -> tuple[date, date]:
@@ -544,6 +696,20 @@ def summarise(rows: list[Row], computed: dict[int, Computed],
     ]
 
 
+WARNING_HIGHLIGHT_RGB = (1.0, 0.87, 0.68)  # soft orange
+WARNING_HIGHLIGHT_FORMULA = '=LEFT($O2,2)="⚠ "'
+
+
+def _apply_new_formatting(sheet_id: str, tab: str) -> None:
+    """Date display format on column A + the ⚠-row highlight rule.
+    Not idempotent (conditional-format rules accumulate) — call once only,
+    either for a brand-new tab (setup_tab) or via --migrate for an existing one."""
+    sheets.format_column_number_format(sheet_id, tab, 0, 1, "dd/mm/yy")
+    sheets.add_conditional_format_formula(
+        sheet_id, tab, 1, 0, 14, WARNING_HIGHLIGHT_FORMULA, WARNING_HIGHLIGHT_RGB
+    )
+
+
 def setup_tab(sheet_id: str, tab: str) -> None:
     created = sheets.ensure_tab(sheet_id, tab)
     sheets.write_range(sheet_id, tab, "A1:T1", [HEADERS])
@@ -552,7 +718,17 @@ def setup_tab(sheet_id: str, tab: str) -> None:
         for col in range(14, 20):  # grey the computed columns O-T
             sheets.format_column_text_color(sheet_id, tab, col, 1, (0.45, 0.45, 0.45))
         sheets.add_conditional_format_positive_negative(sheet_id, tab, 1, 19)  # T
+        _apply_new_formatting(sheet_id, tab)
     print(f"Tab '{tab}' {'created' if created else 'already existed'}; headers written.")
+
+
+def migrate_formatting(sheet_id: str, tab: str) -> None:
+    """One-time: bring an already-existing tab up to date with the date
+    display format + ⚠-row highlight rule, and the renamed header. Re-running
+    this duplicates the highlight rule — run it once only."""
+    sheets.write_range(sheet_id, tab, "A1:T1", [HEADERS])
+    _apply_new_formatting(sheet_id, tab)
+    print(f"Migrated formatting for tab '{tab}': date display + warning highlight rule added.")
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +738,8 @@ def setup_tab(sheet_id: str, tab: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="UK CGT ledger sync + compute")
     parser.add_argument("--setup", action="store_true")
+    parser.add_argument("--migrate", action="store_true",
+                        help="one-time: apply new formatting to an existing tab")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--recompute-only", action="store_true")
     parser.add_argument("--sort", action="store_true",
@@ -576,6 +754,10 @@ def main() -> None:
 
     if args.setup:
         setup_tab(sheet_id, tab)
+        return
+
+    if args.migrate:
+        migrate_formatting(sheet_id, tab)
         return
 
     rows = read_ledger_rows(sheet_id, tab)
@@ -608,23 +790,49 @@ def main() -> None:
             rows.extend(new_rows)
             print(f"Appended {len(new_rows)} rows")
 
-    computed = compute_cgt(rows)
-    summary = summarise(rows, computed, ty_start, ty_end)
+    computed, asset_pools = compute_cgt(rows)
+
+    stubs: list[Row] = []
+    if not args.recompute_only:
+        holdings = fetch_current_holdings()
+        stubs = reconcile_holdings(rows, asset_pools, holdings, ty_start)
 
     if args.dry_run:
+        summary = summarise(rows, computed, ty_start, ty_end)
         print("Summary (existing rows only):")
         for label, value in summary:
             print(f"  {label}: {value}")
+        if stubs:
+            print("Would flag as needing input:")
+            for r in stubs:
+                print("  ", row_to_cells(r))
         return
+
+    if stubs:
+        next_idx = (max(r.idx for r in rows) + 1) if rows else 2
+        for i, r in enumerate(stubs):
+            r.idx = next_idx + i
+        sheets.append_rows(sheet_id, tab, [row_to_cells(r) for r in stubs])
+        rows.extend(stubs)
+        print(f"Flagged {len(stubs)} under-tracked holding(s) for manual input: "
+              + ", ".join(r.asset_in for r in stubs))
+        computed, asset_pools = compute_cgt(rows)
 
     if args.sort and rows:
         rows.sort(key=lambda r: (r.dt or datetime.max.replace(tzinfo=UTC)))
         for i, r in enumerate(rows):
             r.idx = i + 2
-        full = [(r.raw if r.raw else row_to_cells(r)) + [""] * 6 for r in rows]
+        full = [
+            [date_str(r.dt) if r.dt else (r.raw[0] if r.raw else "")]
+            + (r.raw[1:] if r.raw else row_to_cells(r)[1:])
+            + [""] * 6
+            for r in rows
+        ]
         sheets.write_range(sheet_id, tab, f"A2:T{len(rows) + 1}", full)
 
+    write_dates(sheet_id, tab, rows)
     write_computed(sheet_id, tab, rows, computed)
+    summary = summarise(rows, computed, ty_start, ty_end)
     sheets.write_range(sheet_id, tab, "V1:W11", summary)
     print("Computed columns + summary written.")
     net = summary[5][1]

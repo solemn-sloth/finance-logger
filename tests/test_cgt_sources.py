@@ -43,4 +43,17 @@ print(f"{len(orders)} orders")
 for o in orders[:2] + orders[-1:] if orders else []:
     print(json.dumps(o, indent=2, default=str)[:900])
 
+print("--- Kraken balances (reconciliation) ---")
+balances = kraken.get_balances()
+print(balances)
+assert "GBP" not in balances and "ZGBP" not in balances, "fiat leaked through"
+
+print("--- T212 Invest positions (reconciliation) ---")
+positions = t212.get_invest_positions()
+print(json.dumps(positions, indent=2, default=str))
+order_tickers = {o.get("order", {}).get("ticker") for o in orders}
+for p in positions:
+    flag = "(also in this tax year's order history)" if p["ticker"] in order_tickers else ""
+    print(f"  {p['ticker']}: qty={p['quantity']} {flag}")
+
 print("OK")

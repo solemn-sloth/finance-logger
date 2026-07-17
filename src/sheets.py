@@ -205,6 +205,57 @@ def add_conditional_format_positive_negative(
     ).execute()
 
 
+def add_conditional_format_formula(
+    sheet_id: str, tab: str, row_start: int, col_start: int, col_end: int,
+    formula: str, rgb: tuple[float, float, float],
+) -> None:
+    """Add a custom-formula conditional format rule (background color), open-ended
+    row range so it auto-extends to future appended rows.
+
+    Call once only — each call adds new rules; duplicates accumulate in Sheets.
+    """
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    r, g, b = rgb
+    cell_range = {
+        "sheetId": gid,
+        "startRowIndex": row_start,
+        "startColumnIndex": col_start,
+        "endColumnIndex": col_end,
+    }
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"addConditionalFormatRule": {"rule": {
+            "ranges": [cell_range],
+            "booleanRule": {
+                "condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
+                "format": {"backgroundColor": {"red": r, "green": g, "blue": b}},
+            },
+        }, "index": 0}}]},
+    ).execute()
+
+
+def format_column_number_format(
+    sheet_id: str, tab: str, col: int, row_start: int, pattern: str, number_type: str = "DATE"
+) -> None:
+    """Apply a number format (e.g. date pattern) to a column from row_start (0-indexed)."""
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"repeatCell": {
+            "range": {
+                "sheetId": gid,
+                "startRowIndex": row_start,
+                "startColumnIndex": col,
+                "endColumnIndex": col + 1,
+            },
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": number_type, "pattern": pattern}}},
+            "fields": "userEnteredFormat.numberFormat",
+        }}]},
+    ).execute()
+
+
 def update_cell(sheet_id: str, tab: str, cell: str, value) -> None:
     """
     Write a value to a specific cell.

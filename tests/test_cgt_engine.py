@@ -38,12 +38,13 @@ def test_s104_average_cost():
         row("2026-05-01T10:00", "BUY", in_a="ABC", in_q="50", value="600"),
         row("2026-06-01T10:00", "SELL", out_a="ABC", out_q="75", value="900"),
     ]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
     sell = c[rows[2].idx]
     assert sell.match == "S104", sell.match
     assert sell.gain == Decimal("100"), sell.gain  # 900 - 1600*75/150
     assert sell.pool_before == (Decimal("150"), Decimal("1600")), sell.pool_before
     assert sell.pool_after == (Decimal("75"), Decimal("800")), sell.pool_after
+    assert pools["ABC"] == (Decimal("75"), Decimal("800")), pools["ABC"]
 
 
 def test_same_day():
@@ -52,7 +53,7 @@ def test_same_day():
         row("2026-05-01T09:00", "BUY", in_a="ABC", in_q="10", value="100"),
         row("2026-05-01T15:00", "SELL", out_a="ABC", out_q="10", value="120"),
     ]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
     sell = c[rows[2].idx]
     assert sell.match == "SAME_DAY", sell.match
     assert sell.gain == Decimal("20"), sell.gain
@@ -67,7 +68,7 @@ def test_30_day_bed_and_breakfast():
         row("2026-05-01T10:00", "SELL", out_a="ABC", out_q="10", value="150"),
         row("2026-05-11T10:00", "BUY", in_a="ABC", in_q="10", value="100"),
     ]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
     sell = c[rows[1].idx]
     assert sell.match == "30_DAY", sell.match
     assert sell.gain == Decimal("50"), sell.gain
@@ -80,7 +81,7 @@ def test_split_match_30day_plus_pool():
         row("2026-05-01T10:00", "SELL", out_a="ABC", out_q="15", value="300"),
         row("2026-05-06T10:00", "BUY", in_a="ABC", in_q="5", value="60"),
     ]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
     sell = c[rows[1].idx]
     assert "30_DAY 5" in sell.match and "S104 10" in sell.match, sell.match
     assert sell.gain == Decimal("140"), sell.gain  # 300 - (60 + 100)
@@ -94,7 +95,7 @@ def test_swap_is_disposal_and_acquisition():
             in_a="ETH", in_q="10", value="15000"),
         row("2026-06-01T10:00", "SELL", out_a="ETH", out_q="10", value="16000"),
     ]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
     swap = c[rows[1].idx]
     assert swap.gain == Decimal("5000"), swap.gain      # 15000 - 20000*0.5
     assert swap.pool_after == (Decimal("0.5"), Decimal("10000")), swap.pool_after
@@ -107,7 +108,7 @@ def test_reward_basis_from_income_taxed():
         row("2026-05-01T10:00", "REWARD", in_a="SOL", in_q="1", value="100", taxed="100"),
         row("2026-06-01T10:00", "SELL", out_a="SOL", out_q="1", value="150"),
     ]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
     assert c[rows[1].idx].gain == Decimal("50"), c[rows[1].idx].gain
 
 
@@ -116,14 +117,15 @@ def test_fees():
         row("2026-05-01T10:00", "BUY", in_a="ABC", in_q="10", value="100", fee="5"),
         row("2026-06-01T10:00", "SELL", out_a="ABC", out_q="10", value="200", fee="2"),
     ]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
     # buy fee adds to cost (105); sell fee reduces proceeds (198)
     assert c[rows[1].idx].gain == Decimal("93"), c[rows[1].idx].gain
 
 
 def test_shortfall_flagged():
     rows = [row("2026-05-01T10:00", "SELL", out_a="XYZ", out_q="5", value="500")]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
+    assert c[rows[0].idx].match.startswith("⚠ "), c[rows[0].idx].match
     assert "SHORTFALL" in c[rows[0].idx].match, c[rows[0].idx].match
     assert c[rows[0].idx].gain == Decimal("500")
 
@@ -133,9 +135,20 @@ def test_transfers_and_unknown_ignored():
         row("2026-05-01T10:00", "TRANSFER_IN", in_a="BTC", in_q="1"),
         row("2026-05-02T10:00", "FEE", out_a="BTC", out_q="0.001", value="20"),
     ]
-    c = compute_cgt(rows)
+    c, pools = compute_cgt(rows)
     assert c[rows[0].idx].gain is None
     assert c[rows[1].idx].gain is None
+
+
+def test_missing_value_flagged_and_skipped():
+    rows = [
+        row("2026-05-01T10:00", "BUY", in_a="ABC", in_q="10"),  # no value
+        row("2026-06-01T10:00", "SELL", out_a="ABC", out_q="5", value="50"),
+    ]
+    c, pools = compute_cgt(rows)
+    assert c[rows[0].idx].match == "⚠ MISSING VALUE", c[rows[0].idx].match
+    # the BUY never entered the pool, so the SELL has nothing to match against
+    assert "SHORTFALL" in c[rows[1].idx].match, c[rows[1].idx].match
 
 
 if __name__ == "__main__":

@@ -94,6 +94,12 @@ def order_fill_time(item: dict) -> datetime | None:
     return _parse_t212_time(stamp) if stamp else None
 
 
+def get_invest_positions() -> list[dict]:
+    """Current open Invest-account positions: [{ticker, quantity, ...}, ...]."""
+    auth = _auth("T212_INVEST_API_KEY", "T212_INVEST_SECRET_KEY")
+    return _get_json(f"{T212_API}/equity/portfolio", auth)
+
+
 def get_invest_order_history(since: datetime) -> list[dict]:
     """
     Invest-account order fills executed at/after `since` (aware UTC).

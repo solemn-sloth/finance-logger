@@ -201,6 +201,26 @@ def _paginated_private(endpoint: str, result_key: str, since_ts: int) -> list[di
     return entries
 
 
+def get_balances() -> dict:
+    """
+    Current non-zero balances, normalized asset code -> Decimal quantity.
+    Staked variants (ETH2, .S/.M/.F suffixes) collapse into their base asset.
+    Fiat currencies and dust (< 1e-8) are excluded.
+    """
+    from decimal import Decimal
+
+    balances: dict = {}
+    for raw_asset, amount in _private_post("Balance").items():
+        asset = normalize_asset(raw_asset)
+        if asset in FIAT:
+            continue
+        qty = Decimal(str(amount))
+        if qty <= Decimal("0.00000001"):
+            continue
+        balances[asset] = balances.get(asset, Decimal(0)) + qty
+    return balances
+
+
 def get_trades_history(since_ts: int) -> list[dict]:
     """All spot trades since unix ts. Each: id, pair, time, type, price, cost, fee, vol."""
     return _paginated_private("TradesHistory", "trades", since_ts)
