@@ -419,113 +419,124 @@ def compute_cgt(
 # API sources -> Rows (input columns only; idx assigned on append)
 # ---------------------------------------------------------------------------
 
-def fetch_t212_rows(since: datetime) -> list[Row]:
+def _t212_item_to_row(item: dict) -> Row | None:
     """
-    One ledger row per T212 order fill. walletImpact.netValue is the GBP cash
+    Ledger row for one T212 order fill. walletImpact.netValue is the GBP cash
     movement including fees, so the pure consideration is netValue -/+ fee
     (BUY/SELL); the engine re-applies the fee for allowable cost / net proceeds.
     """
     import t212
 
-    rows = []
-    for item in t212.get_invest_order_history(since):
-        order = item.get("order") or {}
-        fill = item.get("fill") or {}
-        if order.get("status") != "FILLED" or not fill:
-            continue
-        dt = t212.order_fill_time(item)
-        instrument = order.get("instrument") or {}
-        side = "BUY" if order.get("side", "").upper() == "BUY" else "SELL"
-        qty = abs(_dec(fill.get("quantity"), Decimal(0)))
-        if not qty or dt is None:
-            print(f"WARN: T212 order {order.get('id')} missing qty/time, skipped")
-            continue
-        impact = fill.get("walletImpact") or {}
-        fee = sum((abs(_dec(t.get("quantity"), Decimal(0)))
-                   for t in impact.get("taxes") or []), Decimal(0))
-        net_value = abs(_dec(impact.get("netValue"), None)
-                        if impact.get("netValue") is not None
-                        else _dec(order.get("filledValue"), Decimal(0)))
-        # netValue includes the fee: strip it for BUY cost, add back for SELL gross
-        gbp = net_value - fee if side == "BUY" else net_value + fee
-        price = fill.get("price")
-        fx = impact.get("fxRate")
-        method = f"T212 walletImpact GBP (fill {price} {instrument.get('currency', '?')}" + (
-            f" @ fx {fx})" if fx else ")"
-        )
-        ticker = order.get("ticker", "")
-        rows.append(Row(
-            idx=0, dt=dt, type=side,
-            asset_out=ticker if side == "SELL" else "",
-            qty_out=qty if side == "SELL" else None,
-            asset_in=ticker if side == "BUY" else "",
-            qty_in=qty if side == "BUY" else None,
-            value_gbp=gbp, method=method,
-            fee_gbp=fee if fee else None, fee_orig="",
-            wallet="T212-Invest", txid=f"T212:{order.get('id')}:{fill.get('id')}",
-            income_taxed=None, notes=instrument.get("name", ""),
-        ))
-    return rows
+    order = item.get("order") or {}
+    fill = item.get("fill") or {}
+    if order.get("status") != "FILLED" or not fill:
+        return None
+    dt = t212.order_fill_time(item)
+    instrument = order.get("instrument") or {}
+    side = "BUY" if order.get("side", "").upper() == "BUY" else "SELL"
+    qty = abs(_dec(fill.get("quantity"), Decimal(0)))
+    if not qty or dt is None:
+        print(f"WARN: T212 order {order.get('id')} missing qty/time, skipped")
+        return None
+    impact = fill.get("walletImpact") or {}
+    fee = sum((abs(_dec(t.get("quantity"), Decimal(0)))
+               for t in impact.get("taxes") or []), Decimal(0))
+    net_value = abs(_dec(impact.get("netValue"), None)
+                    if impact.get("netValue") is not None
+                    else _dec(order.get("filledValue"), Decimal(0)))
+    # netValue includes the fee: strip it for BUY cost, add back for SELL gross
+    gbp = net_value - fee if side == "BUY" else net_value + fee
+    price = fill.get("price")
+    fx = impact.get("fxRate")
+    method = f"T212 walletImpact GBP (fill {price} {instrument.get('currency', '?')}" + (
+        f" @ fx {fx})" if fx else ")"
+    )
+    ticker = order.get("ticker", "")
+    return Row(
+        idx=0, dt=dt, type=side,
+        asset_out=ticker if side == "SELL" else "",
+        qty_out=qty if side == "SELL" else None,
+        asset_in=ticker if side == "BUY" else "",
+        qty_in=qty if side == "BUY" else None,
+        value_gbp=gbp, method=method,
+        fee_gbp=fee if fee else None, fee_orig="",
+        wallet="T212-Invest", txid=f"T212:{order.get('id')}:{fill.get('id')}",
+        income_taxed=None, notes=instrument.get("name", ""),
+    )
+
+
+def fetch_t212_rows(since: datetime) -> list[Row]:
+    import t212
+
+    items = t212.get_invest_order_history(since)
+    return [r for r in (_t212_item_to_row(i) for i in items) if r]
+
+
+def _kraken_trade_to_row(t: dict) -> Row:
+    import kraken
+
+    base, quote = kraken.pair_assets(t["pair"])
+    dt = datetime.fromtimestamp(float(t["time"]), tz=UTC)
+    vol = _dec(t["vol"])
+    cost = _dec(t["cost"])       # in quote currency
+    fee = _dec(t["fee"], Decimal(0))  # in quote currency
+    side = t["type"]
+
+    if quote == "GBP":
+        gbp, method = cost, "Kraken cost (GBP pair)"
+        fee_gbp, fee_orig = fee, ""
+    else:
+        gbp, fx = kraken.get_gbp_value(quote, cost, dt.date())
+        method = f"Kraken cost {cost.normalize():f} {quote}; {fx}"
+        fee_gbp = kraken.get_gbp_value(quote, fee, dt.date())[0] if fee else Decimal(0)
+        fee_orig = f"{fee.normalize():f} {quote}" if fee else ""
+
+    if quote in kraken.FIAT:
+        rtype = "BUY" if side == "buy" else "SELL"
+        out_a, out_q = (base, vol) if rtype == "SELL" else ("", None)
+        in_a, in_q = (base, vol) if rtype == "BUY" else ("", None)
+    else:  # crypto-to-crypto = disposal of one side, acquisition of the other
+        rtype = "SWAP"
+        if side == "buy":
+            out_a, out_q, in_a, in_q = quote, cost, base, vol
+        else:
+            out_a, out_q, in_a, in_q = base, vol, quote, cost
+
+    return Row(
+        idx=0, dt=dt, type=rtype,
+        asset_out=out_a, qty_out=out_q, asset_in=in_a, qty_in=in_q,
+        value_gbp=gbp, method=method,
+        fee_gbp=fee_gbp if fee_gbp else None, fee_orig=fee_orig,
+        wallet="Kraken", txid=f"KRAKEN:{t['id']}",
+        income_taxed=None, notes=t["pair"],
+    )
+
+
+def _kraken_reward_to_row(l: dict) -> Row:
+    import kraken
+
+    asset = kraken.normalize_asset(l["asset"])
+    dt = datetime.fromtimestamp(float(l["time"]), tz=UTC)
+    amount = _dec(l["amount"])
+    gbp, fx = kraken.get_gbp_value(asset, amount, dt.date())
+    return Row(
+        idx=0, dt=dt, type="REWARD",
+        asset_out="", qty_out=None, asset_in=asset, qty_in=amount,
+        value_gbp=gbp, method=fx,
+        fee_gbp=None, fee_orig="",
+        wallet="Kraken", txid=f"KRAKEN:{l['id']}",
+        income_taxed=gbp, notes="staking/earn reward (income at receipt)",
+    )
 
 
 def fetch_kraken_rows(since: datetime) -> list[Row]:
     import kraken
 
     since_ts = int(since.timestamp())
-    rows = []
-
-    for t in kraken.get_trades_history(since_ts):
-        base, quote = kraken.pair_assets(t["pair"])
-        dt = datetime.fromtimestamp(float(t["time"]), tz=UTC)
-        vol = _dec(t["vol"])
-        cost = _dec(t["cost"])       # in quote currency
-        fee = _dec(t["fee"], Decimal(0))  # in quote currency
-        side = t["type"]
-
-        if quote == "GBP":
-            gbp, method = cost, "Kraken cost (GBP pair)"
-            fee_gbp, fee_orig = fee, ""
-        else:
-            gbp, fx = kraken.get_gbp_value(quote, cost, dt.date())
-            method = f"Kraken cost {cost.normalize():f} {quote}; {fx}"
-            fee_gbp = kraken.get_gbp_value(quote, fee, dt.date())[0] if fee else Decimal(0)
-            fee_orig = f"{fee.normalize():f} {quote}" if fee else ""
-
-        if quote in kraken.FIAT:
-            rtype = "BUY" if side == "buy" else "SELL"
-            out_a, out_q = (base, vol) if rtype == "SELL" else ("", None)
-            in_a, in_q = (base, vol) if rtype == "BUY" else ("", None)
-        else:  # crypto-to-crypto = disposal of one side, acquisition of the other
-            rtype = "SWAP"
-            if side == "buy":
-                out_a, out_q, in_a, in_q = quote, cost, base, vol
-            else:
-                out_a, out_q, in_a, in_q = base, vol, quote, cost
-
-        rows.append(Row(
-            idx=0, dt=dt, type=rtype,
-            asset_out=out_a, qty_out=out_q, asset_in=in_a, qty_in=in_q,
-            value_gbp=gbp, method=method,
-            fee_gbp=fee_gbp if fee_gbp else None, fee_orig=fee_orig,
-            wallet="Kraken", txid=f"KRAKEN:{t['id']}",
-            income_taxed=None, notes=t["pair"],
-        ))
-
-    for l in kraken.get_staking_rewards(since_ts):
-        asset = kraken.normalize_asset(l["asset"])
-        dt = datetime.fromtimestamp(float(l["time"]), tz=UTC)
-        amount = _dec(l["amount"])
-        gbp, fx = kraken.get_gbp_value(asset, amount, dt.date())
-        rows.append(Row(
-            idx=0, dt=dt, type="REWARD",
-            asset_out="", qty_out=None, asset_in=asset, qty_in=amount,
-            value_gbp=gbp, method=fx,
-            fee_gbp=None, fee_orig="",
-            wallet="Kraken", txid=f"KRAKEN:{l['id']}",
-            income_taxed=gbp, notes="staking/earn reward (income at receipt)",
-        ))
-
-    return rows
+    return (
+        [_kraken_trade_to_row(t) for t in kraken.get_trades_history(since_ts)]
+        + [_kraken_reward_to_row(l) for l in kraken.get_staking_rewards(since_ts)]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -558,41 +569,96 @@ def fetch_current_holdings() -> dict[str, tuple[Decimal, str]]:
     return holdings
 
 
+def backfill_opening(
+    asset: str, wallet: str, missing_qty: Decimal, ty_start: date,
+) -> tuple[Row | None, str]:
+    """
+    Try to reconstruct the opening Section 104 pool for `asset` from full
+    pre-tax-year API history (T212 order fills / Kraken trades + rewards),
+    reusing the CGT engine for the pool maths.
+
+    Returns (completed OPENING Row, "") if the reconstructed units match
+    missing_qty, else (None, summary of what was found) so the caller can
+    enrich the manual stub. Backfill failures never guess at a value.
+    """
+    window = datetime(ty_start.year, ty_start.month, ty_start.day, tzinfo=UTC)
+    try:
+        if wallet == "T212-Invest":
+            import t212
+
+            items = t212.get_invest_order_history(None, ticker=asset)
+            hist = [r for r in (_t212_item_to_row(i) for i in items)
+                    if r and r.dt < window]
+            source = "T212 order history"
+        else:
+            import kraken
+
+            # Filter raw entries by asset + time BEFORE converting: conversion
+            # triggers per-day OHLC valuation calls we don't want to waste.
+            window_ts = window.timestamp()
+            trades = [t for t in kraken.get_trades_history(0)
+                      if float(t["time"]) < window_ts
+                      and asset in kraken.pair_assets(t["pair"])]
+            rewards = [l for l in kraken.get_staking_rewards(0)
+                       if float(l["time"]) < window_ts
+                       and kraken.normalize_asset(l["asset"]) == asset]
+            hist = [_kraken_trade_to_row(t) for t in trades]
+            hist += [_kraken_reward_to_row(l) for l in rewards]
+            source = "Kraken trade/reward history"
+    except Exception as exc:
+        print(f"WARN: {wallet} backfill fetch for {asset} failed: {exc}", file=sys.stderr)
+        return None, f"backfill attempted: {wallet} history fetch failed ({exc})"
+
+    if not hist:
+        return None, f"backfill attempted: no pre-{ty_start} {asset} transactions found in {source}"
+
+    for i, r in enumerate(hist):
+        r.idx = i
+    _, pools = compute_cgt(hist)
+    units, cost = pools.get(asset, (Decimal(0), Decimal(0)))
+
+    if abs(units - missing_qty) <= RECONCILE_TOLERANCE:
+        prefix = "T212" if wallet == "T212-Invest" else "KRAKEN"
+        return Row(
+            idx=0,
+            dt=window - timedelta(days=1), type="OPENING",
+            asset_out="", qty_out=None, asset_in=asset, qty_in=units,
+            value_gbp=cost, method=f"{source} backfill (fills before {ty_start})",
+            fee_gbp=None, fee_orig="", wallet=wallet,
+            txid=f"{prefix}:OPENING-{asset}", income_taxed=None,
+            notes=(f"Opening pool auto-computed from {len(hist)} pre-{ty_start} "
+                   f"transaction(s) in {source}."),
+        ), ""
+    return None, (
+        f"backfill attempted: {source} only reconstructs "
+        f"{units.normalize():f} {asset} (cost £{cost:.2f}) of the "
+        f"{missing_qty.normalize():f} missing — remainder likely deposited/"
+        f"transferred in from elsewhere; enter the combined cost basis manually."
+    )
+
+
 def reconcile_holdings(
     rows: list[Row], asset_pools: dict[str, tuple[Decimal, Decimal]],
     holdings: dict[str, tuple[Decimal, str]], ty_start: date,
-) -> list[Row]:
+) -> tuple[list[Row], list[Row]]:
     """
-    Stub OPENING rows for assets held in real life but under-explained by the
-    ledger's Section 104 pools. Value is left blank so the row is flagged
-    (⚠ MISSING VALUE) until the user fills in the real cost basis. Never
-    auto-writes the reverse case (ledger tracks MORE than actually held) —
-    that could be an untaxable transfer to self-custody, not a disposal —
-    it's only printed as a console warning.
+    Compare actual holdings against ledger pools. For under-tracked assets,
+    first try backfill_opening; if that fails, produce a manual-input stub
+    (Value blank so it's highlighted until filled).
+
+    Returns (rows to append, rows to write over an existing stub in place).
+    A stub row (MANUAL:NEEDS-INPUT-*) stays script-owned only while its Value
+    is blank AND no backfill has been attempted yet; the moment the user fills
+    Value it's theirs and is never touched. Never auto-writes the reverse case
+    (ledger tracks MORE than actually held) — that could be an untaxable
+    transfer to self-custody, not a disposal — console warning only.
     """
-    known_txids = {r.txid for r in rows if r.txid}
     stub_dt = datetime(ty_start.year, ty_start.month, ty_start.day, tzinfo=UTC) - timedelta(days=1)
-    stubs = []
+    to_append, to_replace = [], []
     for asset, (actual_qty, wallet) in sorted(holdings.items()):
         tracked_qty = asset_pools.get(asset, (Decimal(0), Decimal(0)))[0]
         diff = actual_qty - tracked_qty
-        if diff > RECONCILE_TOLERANCE:
-            txid = f"MANUAL:NEEDS-INPUT-{asset}"
-            if txid in known_txids:
-                continue
-            stubs.append(Row(
-                idx=0, dt=stub_dt, type="OPENING",
-                asset_out="", qty_out=None, asset_in=asset, qty_in=diff,
-                value_gbp=None, method="",
-                fee_gbp=None, fee_orig="", wallet=wallet, txid=txid,
-                income_taxed=None,
-                notes=(f"Auto-flagged: {wallet} shows {actual_qty.normalize():f} {asset} but "
-                       f"the ledger only accounts for {tracked_qty.normalize():f}. Fill in "
-                       f"Value (GBP) with the cost basis for the missing {diff.normalize():f} "
-                       f"units, and correct the date above if this wasn't all acquired before "
-                       f"the tax year start."),
-            ))
-        elif diff < -RECONCILE_TOLERANCE:
+        if diff < -RECONCILE_TOLERANCE:
             print(
                 f"WARN: {asset} tracked pool ({tracked_qty.normalize():f}) exceeds actual "
                 f"{wallet} balance ({actual_qty.normalize():f}) by {(-diff).normalize():f} — "
@@ -600,7 +666,41 @@ def reconcile_holdings(
                 f"to self-custody, no ledger action needed; if sold/spent/gifted, add a "
                 f"manual SELL row.", file=sys.stderr,
             )
-    return stubs
+            continue
+        if diff <= RECONCILE_TOLERANCE:
+            continue
+
+        stub_txid = f"MANUAL:NEEDS-INPUT-{asset}"
+        existing = next((r for r in rows if r.txid == stub_txid), None)
+        if existing is not None:
+            if existing.value_gbp is not None:  # user filled it in — theirs now
+                continue
+            if "backfill attempted" in existing.notes:  # already tried, don't re-fetch daily
+                continue
+
+        resolved, attempt_note = backfill_opening(asset, wallet, diff, ty_start)
+        if resolved is not None:
+            if existing is not None:
+                resolved.idx = existing.idx
+                to_replace.append(resolved)
+            else:
+                to_append.append(resolved)
+            continue
+
+        stub = Row(
+            idx=existing.idx if existing else 0, dt=stub_dt, type="OPENING",
+            asset_out="", qty_out=None, asset_in=asset, qty_in=diff,
+            value_gbp=None, method="",
+            fee_gbp=None, fee_orig="", wallet=wallet, txid=stub_txid,
+            income_taxed=None,
+            notes=(f"Auto-flagged: {wallet} shows {actual_qty.normalize():f} {asset} but "
+                   f"the ledger only accounts for {tracked_qty.normalize():f}. Fill in "
+                   f"Value (GBP) with the cost basis for the missing {diff.normalize():f} "
+                   f"units, and correct the date above if this wasn't all acquired before "
+                   f"the tax year start. [{attempt_note}]"),
+        )
+        (to_replace if existing is not None else to_append).append(stub)
+    return to_append, to_replace
 
 
 # ---------------------------------------------------------------------------
@@ -696,39 +796,98 @@ def summarise(rows: list[Row], computed: dict[int, Computed],
     ]
 
 
-WARNING_HIGHLIGHT_RGB = (1.0, 0.87, 0.68)  # soft orange
-WARNING_HIGHLIGHT_FORMULA = '=LEFT($O2,2)="⚠ "'
+# --- Conditional formatting (re-pinned idempotently every run) --------------
+#
+# The highlight formulas evaluate directly on the INPUT columns, so a cell's
+# highlight clears the instant the user types into it — no waiting for the
+# nightly recompute. Column O's ⚠ status text is the explanation, not the
+# trigger.
+
+_ORANGE = {"red": 1.0, "green": 0.87, "blue": 0.68}
+_GREEN = {"red": 0.133, "green": 0.545, "blue": 0.133}
+_RED = {"red": 0.8, "green": 0.0, "blue": 0.0}
 
 
-def _apply_new_formatting(sheet_id: str, tab: str) -> None:
-    """Date display format on column A + the ⚠-row highlight rule.
-    Not idempotent (conditional-format rules accumulate) — call once only,
-    either for a brand-new tab (setup_tab) or via --migrate for an existing one."""
+def _highlight_rule(formula: str, col_start: int, col_end: int) -> dict:
+    return {
+        "ranges": [{"startRowIndex": 1, "startColumnIndex": col_start, "endColumnIndex": col_end}],
+        "booleanRule": {
+            "condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
+            "format": {"backgroundColor": _ORANGE},
+        },
+    }
+
+
+def _gain_color_rule(condition_type: str, color: dict) -> dict:
+    return {
+        "ranges": [{"startRowIndex": 1, "startColumnIndex": 19, "endColumnIndex": 20}],
+        "booleanRule": {
+            "condition": {"type": condition_type, "values": [{"userEnteredValue": "0"}]},
+            "format": {"textFormat": {"foregroundColor": color}},
+        },
+    }
+
+
+_TYPES_ARRAY = '{"BUY";"SELL";"SWAP";"REWARD";"OPENING";"TRANSFER_IN";"TRANSFER_OUT";"FEE"}'
+CONDITIONAL_RULES = [
+    # Value (G) required but missing
+    _highlight_rule(
+        '=AND($G2="", OR($B2="BUY",$B2="SELL",$B2="SWAP",$B2="OPENING",'
+        ' AND($B2="REWARD",$M2="")))', 6, 7),
+    # Date (A) missing on a non-empty row
+    _highlight_rule('=AND($A2="", $B2<>"")', 0, 1),
+    # Type (B) unrecognised
+    _highlight_rule(f'=AND($B2<>"", ISNA(MATCH($B2,{_TYPES_ARRAY},0)))', 1, 2),
+    # Asset/Qty Out (C:D) missing on a disposal
+    _highlight_rule('=AND(OR($B2="SELL",$B2="SWAP"), OR($C2="",$D2=""))', 2, 4),
+    # Asset/Qty In (E:F) missing on an acquisition
+    _highlight_rule(
+        '=AND(OR($B2="BUY",$B2="REWARD",$B2="OPENING",$B2="SWAP"), OR($E2="",$F2=""))', 4, 6),
+    # Gain/Loss (T) green/red
+    _gain_color_rule("NUMBER_GREATER", _GREEN),
+    _gain_color_rule("NUMBER_LESS", _RED),
+]
+
+HEADER_NOTES = {
+    "A1": "Transaction date, dd/mm/yy (Europe/London calendar day; time not tracked).",
+    "L1": ("Txn ID — the sync's dedupe key (stops the daily run re-importing the same "
+           "transaction). Leave blank for manual rows, or use MANUAL:<anything-unique>."),
+    "M1": ("Income already taxed (GBP) — for RSU vests and staking rewards: the amount "
+           "taxed as income at receipt. Becomes the acquisition cost basis."),
+    "O1": ("HMRC share-matching rule applied to this disposal:\n"
+           "SAME_DAY — matched against acquisitions on the same day\n"
+           "30_DAY — bed & breakfast rule, matched against buys in the next 30 days\n"
+           "S104 — Section 104 pool (average cost of all prior holdings)\n"
+           "⚠ — row needs attention (see highlighted cells)\n\n"
+           "Columns O-T are recomputed by the daily 8:30am sync — after editing "
+           "inputs, values here refresh on the next run."),
+}
+
+
+def _apply_formatting(sheet_id: str, tab: str) -> None:
+    """Full tab formatting. Everything here is idempotent — safe to re-run."""
+    sheets.write_range(sheet_id, tab, "A1:T1", [HEADERS])
+    sheets.freeze_rows(sheet_id, tab, 1)
+    for col in range(14, 20):  # grey the computed columns O-T
+        sheets.format_column_text_color(sheet_id, tab, col, 1, (0.45, 0.45, 0.45))
     sheets.format_column_number_format(sheet_id, tab, 0, 1, "dd/mm/yy")
-    sheets.add_conditional_format_formula(
-        sheet_id, tab, 1, 0, 14, WARNING_HIGHLIGHT_FORMULA, WARNING_HIGHLIGHT_RGB
-    )
+    sheets.replace_all_conditional_format_rules(sheet_id, tab, CONDITIONAL_RULES)
+    sheets.set_column_hidden(sheet_id, tab, 11)  # Txn ID: machine bookkeeping
+    for cell, note in HEADER_NOTES.items():
+        col = ord(cell[0]) - ord("A")
+        sheets.set_cell_note(sheet_id, tab, int(cell[1:]) - 1, col, note)
 
 
 def setup_tab(sheet_id: str, tab: str) -> None:
     created = sheets.ensure_tab(sheet_id, tab)
-    sheets.write_range(sheet_id, tab, "A1:T1", [HEADERS])
-    sheets.freeze_rows(sheet_id, tab, 1)
-    if created:
-        for col in range(14, 20):  # grey the computed columns O-T
-            sheets.format_column_text_color(sheet_id, tab, col, 1, (0.45, 0.45, 0.45))
-        sheets.add_conditional_format_positive_negative(sheet_id, tab, 1, 19)  # T
-        _apply_new_formatting(sheet_id, tab)
-    print(f"Tab '{tab}' {'created' if created else 'already existed'}; headers written.")
+    _apply_formatting(sheet_id, tab)
+    print(f"Tab '{tab}' {'created' if created else 'already existed'}; formatting applied.")
 
 
 def migrate_formatting(sheet_id: str, tab: str) -> None:
-    """One-time: bring an already-existing tab up to date with the date
-    display format + ⚠-row highlight rule, and the renamed header. Re-running
-    this duplicates the highlight rule — run it once only."""
-    sheets.write_range(sheet_id, tab, "A1:T1", [HEADERS])
-    _apply_new_formatting(sheet_id, tab)
-    print(f"Migrated formatting for tab '{tab}': date display + warning highlight rule added.")
+    """Bring an existing tab up to date with current formatting. Idempotent."""
+    _apply_formatting(sheet_id, tab)
+    print(f"Formatting refreshed for tab '{tab}'.")
 
 
 # ---------------------------------------------------------------------------
@@ -790,33 +949,43 @@ def main() -> None:
             rows.extend(new_rows)
             print(f"Appended {len(new_rows)} rows")
 
-    computed, asset_pools = compute_cgt(rows)
-
-    stubs: list[Row] = []
+    # Reconciliation (pass-1 pools feed it; needs live APIs)
+    to_append: list[Row] = []
+    to_replace: list[Row] = []
     if not args.recompute_only:
+        _, asset_pools = compute_cgt(rows)
         holdings = fetch_current_holdings()
-        stubs = reconcile_holdings(rows, asset_pools, holdings, ty_start)
+        to_append, to_replace = reconcile_holdings(rows, asset_pools, holdings, ty_start)
 
     if args.dry_run:
+        computed, _ = compute_cgt(rows)
         summary = summarise(rows, computed, ty_start, ty_end)
         print("Summary (existing rows only):")
         for label, value in summary:
             print(f"  {label}: {value}")
-        if stubs:
-            print("Would flag as needing input:")
-            for r in stubs:
-                print("  ", row_to_cells(r))
+        for verb, batch in (("append", to_append), ("update in place", to_replace)):
+            if batch:
+                print(f"Would {verb}:")
+                for r in batch:
+                    print("  ", row_to_cells(r))
         return
 
-    if stubs:
+    # Apply reconciliation results (all row mutations happen BEFORE final compute)
+    if to_replace:
+        by_idx = {r.idx: r for r in to_replace}
+        rows = [by_idx.get(r.idx, r) for r in rows]
+        for r in to_replace:
+            sheets.write_range(sheet_id, tab, f"A{r.idx}:N{r.idx}", [row_to_cells(r)])
+        print(f"Updated {len(to_replace)} stub row(s) in place: "
+              + ", ".join(r.asset_in for r in to_replace))
+    if to_append:
         next_idx = (max(r.idx for r in rows) + 1) if rows else 2
-        for i, r in enumerate(stubs):
+        for i, r in enumerate(to_append):
             r.idx = next_idx + i
-        sheets.append_rows(sheet_id, tab, [row_to_cells(r) for r in stubs])
-        rows.extend(stubs)
-        print(f"Flagged {len(stubs)} under-tracked holding(s) for manual input: "
-              + ", ".join(r.asset_in for r in stubs))
-        computed, asset_pools = compute_cgt(rows)
+        sheets.append_rows(sheet_id, tab, [row_to_cells(r) for r in to_append])
+        rows.extend(to_append)
+        print(f"Added {len(to_append)} holding row(s): "
+              + ", ".join(r.asset_in for r in to_append))
 
     if args.sort and rows:
         rows.sort(key=lambda r: (r.dt or datetime.max.replace(tzinfo=UTC)))
@@ -830,8 +999,12 @@ def main() -> None:
         ]
         sheets.write_range(sheet_id, tab, f"A2:T{len(rows) + 1}", full)
 
+    # Final compute AFTER every row mutation, so O-T always aligns with rows
+    computed, _ = compute_cgt(rows)
+
     write_dates(sheet_id, tab, rows)
     write_computed(sheet_id, tab, rows, computed)
+    sheets.replace_all_conditional_format_rules(sheet_id, tab, CONDITIONAL_RULES)
     summary = summarise(rows, computed, ty_start, ty_end)
     sheets.write_range(sheet_id, tab, "V1:W11", summary)
     print("Computed columns + summary written.")

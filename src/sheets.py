@@ -205,33 +205,64 @@ def add_conditional_format_positive_negative(
     ).execute()
 
 
-def add_conditional_format_formula(
-    sheet_id: str, tab: str, row_start: int, col_start: int, col_end: int,
-    formula: str, rgb: tuple[float, float, float],
-) -> None:
-    """Add a custom-formula conditional format rule (background color), open-ended
-    row range so it auto-extends to future appended rows.
+def replace_all_conditional_format_rules(sheet_id: str, tab: str, rules: list[dict]) -> None:
+    """
+    Delete every conditional format rule on the tab and add `rules` (Sheets API
+    ConditionalFormatRule dicts, without sheetId filled into their ranges).
 
-    Call once only — each call adds new rules; duplicates accumulate in Sheets.
+    Idempotent by construction — safe to call on every run. This also heals
+    range drift: INSERT_ROWS appends silently shift existing rule ranges.
     """
     service = get_sheet_service()
     gid = _get_sheet_gid(sheet_id, tab)
-    r, g, b = rgb
-    cell_range = {
-        "sheetId": gid,
-        "startRowIndex": row_start,
-        "startColumnIndex": col_start,
-        "endColumnIndex": col_end,
-    }
+    meta = service.spreadsheets().get(
+        spreadsheetId=sheet_id, fields="sheets(properties.sheetId,conditionalFormats)"
+    ).execute()
+    existing = 0
+    for s in meta["sheets"]:
+        if s["properties"]["sheetId"] == gid:
+            existing = len(s.get("conditionalFormats", []))
+    requests = [
+        {"deleteConditionalFormatRule": {"sheetId": gid, "index": 0}}
+        for _ in range(existing)
+    ]
+    for i, rule in enumerate(rules):
+        rule = dict(rule)
+        rule["ranges"] = [{**rng, "sheetId": gid} for rng in rule["ranges"]]
+        requests.append({"addConditionalFormatRule": {"rule": rule, "index": i}})
+    if requests:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id, body={"requests": requests}
+        ).execute()
+
+
+def set_column_hidden(sheet_id: str, tab: str, col: int, hidden: bool = True) -> None:
+    """Hide or unhide a column (0-indexed). Data and API access are unaffected."""
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
     service.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id,
-        body={"requests": [{"addConditionalFormatRule": {"rule": {
-            "ranges": [cell_range],
-            "booleanRule": {
-                "condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
-                "format": {"backgroundColor": {"red": r, "green": g, "blue": b}},
-            },
-        }, "index": 0}}]},
+        body={"requests": [{"updateDimensionProperties": {
+            "range": {"sheetId": gid, "dimension": "COLUMNS",
+                      "startIndex": col, "endIndex": col + 1},
+            "properties": {"hiddenByUser": hidden},
+            "fields": "hiddenByUser",
+        }}]},
+    ).execute()
+
+
+def set_cell_note(sheet_id: str, tab: str, row: int, col: int, note: str) -> None:
+    """Set a hover note on a single cell (0-indexed row/col)."""
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"updateCells": {
+            "range": {"sheetId": gid, "startRowIndex": row, "endRowIndex": row + 1,
+                      "startColumnIndex": col, "endColumnIndex": col + 1},
+            "rows": [{"values": [{"note": note}]}],
+            "fields": "note",
+        }}]},
     ).execute()
 
 

@@ -100,14 +100,17 @@ def get_invest_positions() -> list[dict]:
     return _get_json(f"{T212_API}/equity/portfolio", auth)
 
 
-def get_invest_order_history(since: datetime) -> list[dict]:
+def get_invest_order_history(since: datetime | None, ticker: str | None = None) -> list[dict]:
     """
-    Invest-account order fills executed at/after `since` (aware UTC).
+    Invest-account order fills executed at/after `since` (aware UTC; None for
+    the full account history). Optionally filtered to one ticker server-side.
     Items are {"order": {...}, "fill": {...}} pairs, newest first; pagination
     stops once items predate `since`.
     """
     auth = _auth("T212_INVEST_API_KEY", "T212_INVEST_SECRET_KEY")
     url = f"{T212_API}/equity/history/orders?limit=50"
+    if ticker:
+        url += f"&ticker={ticker}"
     items: list[dict] = []
     while url:
         body = _get_json(url, auth)
@@ -115,7 +118,7 @@ def get_invest_order_history(since: datetime) -> list[dict]:
         reached_since = False
         for item in page:
             stamp = order_fill_time(item)
-            if stamp and stamp < since:
+            if since and stamp and stamp < since:
                 reached_since = True
                 break
             items.append(item)

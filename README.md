@@ -89,20 +89,25 @@ the tax-year summary block.
 python src/cgt_ledger.py --setup   # creates the tab, headers, formatting
 ```
 
-Running `--setup` against a tab that already existed before this formatting
-was added? Run `python src/cgt_ledger.py --migrate` once instead (applies the
-date display format + the ⚠-row highlight rule to the existing tab; re-running
-it duplicates the highlight rule, so only run it once).
+For a tab that already exists, `python src/cgt_ledger.py --migrate` refreshes
+headers, formats, highlight rules, header notes, and hides the Txn ID column.
+It's idempotent — safe to re-run any time (rules are replaced, not stacked).
 
-Then add an `OPENING` row per asset held before the tracked tax year starts
-(`CGT_TAX_YEAR_START` in `.env`) — Type `OPENING`, Asset In + Qty In, Value =
-pool cost in GBP, dated the day before the tax year start, Txn ID
-`MANUAL:OPENING-<ASSET>`. Without this, gains on later disposals of
-pre-existing holdings will be overstated. Every run automatically checks your
-actual T212/Kraken holdings against what the ledger accounts for and appends
-a stub `OPENING` row (Txn ID `MANUAL:NEEDS-INPUT-<ASSET>`) for anything
-under-tracked — its Value is left blank on purpose so the row shows up
-highlighted (⚠ MISSING VALUE) until you fill in the real cost basis.
+Opening pools for assets held before the tracked tax year start
+(`CGT_TAX_YEAR_START` in `.env`) are handled automatically where possible:
+every run compares actual T212/Kraken holdings against what the ledger
+accounts for, and for anything under-tracked first tries to reconstruct the
+opening Section 104 pool from full pre-tax-year API history (exact GBP costs
+from T212 order fills; Kraken trades + rewards). Only if that fails — e.g.
+crypto deposited from an external wallet, where no purchase record exists —
+does it write a stub `OPENING` row with Value left blank; the Value cell is
+highlighted until you fill in the real cost basis, and the Notes column says
+what the backfill did or didn't find. Highlights are formula-driven, so they
+clear the instant you type; the computed columns (O–T) refresh on the next
+run (nightly 8:30am, or `--recompute-only` on demand).
+
+The Txn ID column (L, hidden) is the sync's dedupe key — leave it blank on
+manual rows, or use `MANUAL:<anything-unique>`.
 
 For RSU vests: Type `REWARD`, Asset In/Qty In, Value = market value at vest,
 and `Income Taxed` (column M) = the amount already taxed through payroll —
@@ -119,7 +124,7 @@ python src/cgt_ledger.py                   # sync from APIs + recompute
 python src/cgt_ledger.py --dry-run         # preview without writing
 python src/cgt_ledger.py --recompute-only  # skip APIs, just recompute
 python src/cgt_ledger.py --sort            # also physically re-sort rows by date
-python src/cgt_ledger.py --migrate         # one-time: reformat an existing tab
+python src/cgt_ledger.py --migrate         # refresh formatting on an existing tab (idempotent)
 ```
 
 Runs daily via cron at 8:30am (see `config/crontab.example`), separate from
