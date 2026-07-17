@@ -72,6 +72,67 @@ def append_row(sheet_id: str, tab: str, values: list) -> None:
     ).execute()
 
 
+def read_range(sheet_id: str, tab: str, a1: str) -> list[list]:
+    """Read a range; returns list of rows (formatted values). Trailing empties omitted by API."""
+    service = get_sheet_service()
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=f"'{tab}'!{a1}")
+        .execute()
+    )
+    return result.get("values", [])
+
+
+def write_range(sheet_id: str, tab: str, a1: str, values: list[list], raw: bool = True) -> None:
+    """Write a 2D block starting at a1. raw=True keeps strings/numbers as given."""
+    service = get_sheet_service()
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"'{tab}'!{a1}",
+        valueInputOption="RAW" if raw else "USER_ENTERED",
+        body={"values": values},
+    ).execute()
+
+
+def append_rows(sheet_id: str, tab: str, rows: list[list], raw: bool = True) -> None:
+    """Append multiple rows after the last data row of the tab."""
+    service = get_sheet_service()
+    service.spreadsheets().values().append(
+        spreadsheetId=sheet_id,
+        range=f"'{tab}'!A1",
+        valueInputOption="RAW" if raw else "USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": rows},
+    ).execute()
+
+
+def ensure_tab(sheet_id: str, tab: str) -> bool:
+    """Create the tab if it doesn't exist. Returns True if created."""
+    service = get_sheet_service()
+    meta = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    if any(s["properties"]["title"] == tab for s in meta["sheets"]):
+        return False
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+    ).execute()
+    return True
+
+
+def freeze_rows(sheet_id: str, tab: str, count: int = 1) -> None:
+    """Freeze the top `count` rows of a tab."""
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": gid, "gridProperties": {"frozenRowCount": count}},
+            "fields": "gridProperties.frozenRowCount",
+        }}]},
+    ).execute()
+
+
 def _get_sheet_gid(sheet_id: str, tab_name: str) -> int:
     """Return the numeric sheet GID for a tab by name."""
     service = get_sheet_service()

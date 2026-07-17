@@ -10,3 +10,6 @@
 
 # Daily snapshot — 8am every day
 0 8 * * * /usr/bin/python3 "/home/root/finance-logger/src/daily_snapshot.py" >> /var/log/finance/daily.log 2>&1
+
+# CGT ledger sync — 8:30am daily (separate from snapshot: slower, T212 rate limits)
+30 8 * * * cd "/home/root/projects/Finance Automations" && python3 src/cgt_ledger.py >> /home/root/logs/cron/cgt-ledger.log 2>&1

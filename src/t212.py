@@ -6,6 +6,8 @@ Endpoint: ISA/Invest account summary via the T212 public beta API.
 """
 
 import os
+import time
+from datetime import datetime, timezone
 from requests.auth import HTTPBasicAuth
 
 from pathlib import Path
@@ -15,7 +17,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / "config" / ".env")
 
-T212_API = "https://live.trading212.com/api/v0"
+T212_HOST = "https://live.trading212.com"
+T212_API = f"{T212_HOST}/api/v0"
 
 
 def _auth(key_var: str = "T212_API_KEY", secret_var: str = "T212_SECRET_KEY") -> HTTPBasicAuth:
@@ -55,3 +58,64 @@ def get_portfolio() -> dict:
 def get_invest_portfolio() -> dict:
     """Return total Invest (non-ISA) portfolio value and profit."""
     return _fetch_summary(_auth("T212_INVEST_API_KEY", "T212_INVEST_SECRET_KEY"))
+
+
+# ---------------------------------------------------------------------------
+# CGT ledger support: order history + instrument metadata (Invest account).
+# History endpoints are heavily rate-limited (~1 req / 5-10 s).
+# ---------------------------------------------------------------------------
+
+
+def _get_json(url: str, auth: HTTPBasicAuth, max_retries: int = 6) -> dict:
+    """GET with 429 backoff."""
+    for attempt in range(max_retries):
+        resp = requests.get(url, auth=auth, timeout=30)
+        if resp.status_code == 429:
+            wait = max(int(resp.headers.get("Retry-After", 0) or 0), 10 * (attempt + 1))
+            time.sleep(wait)
+            continue
+        if not resp.ok:
+            raise RuntimeError(f"Trading 212 GET {url} failed: {resp.status_code} {resp.text}")
+        return resp.json()
+    raise RuntimeError(f"Trading 212 GET {url}: rate-limited after {max_retries} retries")
+
+
+def _parse_t212_time(value: str) -> datetime:
+    """Parse a T212 ISO timestamp to an aware UTC datetime."""
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def order_fill_time(item: dict) -> datetime | None:
+    """Execution timestamp of a history item ({order:..., fill:...} shape)."""
+    stamp = (item.get("fill") or {}).get("filledAt") or (item.get("order") or {}).get("createdAt")
+    return _parse_t212_time(stamp) if stamp else None
+
+
+def get_invest_order_history(since: datetime) -> list[dict]:
+    """
+    Invest-account order fills executed at/after `since` (aware UTC).
+    Items are {"order": {...}, "fill": {...}} pairs, newest first; pagination
+    stops once items predate `since`.
+    """
+    auth = _auth("T212_INVEST_API_KEY", "T212_INVEST_SECRET_KEY")
+    url = f"{T212_API}/equity/history/orders?limit=50"
+    items: list[dict] = []
+    while url:
+        body = _get_json(url, auth)
+        page = body.get("items", [])
+        reached_since = False
+        for item in page:
+            stamp = order_fill_time(item)
+            if stamp and stamp < since:
+                reached_since = True
+                break
+            items.append(item)
+        next_path = body.get("nextPagePath")
+        if reached_since or not page or not next_path:
+            break
+        url = T212_HOST + next_path if next_path.startswith("/") else next_path
+        time.sleep(6)
+    return items
