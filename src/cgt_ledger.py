@@ -1038,7 +1038,9 @@ def write_sorted_data(sheet_id: str, tab: str, rows: list[Row],
     while len(block) < region_end - 1:
         block.append([""] * N_COLS)
     if block:
-        sheets.write_range(sheet_id, tab, f"A2:T{len(block) + 1}", block)
+        # updateCells, not values.update: writing "" through values.update
+        # resets whole cells and strips their number formats
+        sheets.write_values_grid(sheet_id, tab, 2, 1, block)
 
 
 # ---------------------------------------------------------------------------

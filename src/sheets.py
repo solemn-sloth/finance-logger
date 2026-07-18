@@ -387,6 +387,41 @@ def format_column_number_format(
     ).execute()
 
 
+def write_values_grid(sheet_id: str, tab: str, start_row: int, start_col: int,
+                      values: list[list]) -> None:
+    """
+    Write a 2D block of values via updateCells with fields="userEnteredValue".
+    Unlike values.update, this is guaranteed to leave cell FORMATTING intact —
+    writing "" through values.update resets the whole cell, stripping its
+    number format. Empty string / None clears the value, format survives.
+    start_row/start_col are 1-based.
+    """
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+
+    def cell(v):
+        if v is None or v == "":
+            return {}
+        if isinstance(v, bool):
+            return {"userEnteredValue": {"boolValue": v}}
+        if isinstance(v, (int, float)):
+            return {"userEnteredValue": {"numberValue": v}}
+        return {"userEnteredValue": {"stringValue": str(v)}}
+
+    rows = [{"values": [cell(v) for v in row]} for row in values]
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"updateCells": {
+            "range": {"sheetId": gid,
+                      "startRowIndex": start_row - 1,
+                      "endRowIndex": start_row - 1 + len(values),
+                      "startColumnIndex": start_col - 1},
+            "rows": rows,
+            "fields": "userEnteredValue",
+        }}]},
+    ).execute()
+
+
 def apply_formats(sheet_id: str, tab: str,
                   formats: list[tuple[dict, dict, str]]) -> None:
     """
