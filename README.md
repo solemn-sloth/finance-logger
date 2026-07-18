@@ -79,9 +79,21 @@ It auto-imports new transactions from both APIs and computes gains using UK
 share-matching rules (same-day → 30-day bed & breakfast → Section 104 pooling).
 
 Manually entered rows (RSUs, Raisin, anything without an API) are fully
-supported and always preserved — the script only ever appends new rows
+supported and always preserved — the script only ever adds new rows
 (columns A–N, deduped by Txn ID) and rewrites the computed columns (O–T) plus
-the tax-year summary block.
+the summary block. Rows are kept physically sorted by date every run, so the
+ledger reads grouped by tax year; input cells are rewritten verbatim (the one
+exception: column A is normalised to a real dd/mm/yyyy Date cell).
+
+Everything lives on the one `CGT Ledger` tab: data rows at the top, then a
+blank spacer row, then a `CGT SUMMARY` block — labels down column A, one
+column per tax year. The block includes the UK loss carry-forward chain:
+current-year losses offset current-year gains first, brought-forward losses
+then reduce net gains only down to the annual exempt amount, and the unused
+remainder carries into the next year's column automatically. Losses from
+years before the ledger started can be seeded with `CGT_LOSSES_BF` in `.env`.
+New rows are inserted above the summary block and inherit the neighbouring
+row's formatting — restyle columns however you like and the script follows.
 
 ### One-time setup
 
@@ -90,7 +102,8 @@ python src/cgt_ledger.py --setup   # creates the tab, headers, formatting
 ```
 
 For a tab that already exists, `python src/cgt_ledger.py --migrate` refreshes
-headers, formats, highlight rules, header notes, and hides the Txn ID column.
+headers, formats (dd/mm/yyyy dates, £ money columns), highlight rules, header
+notes, hides the Txn ID column, sorts the rows and writes the summary block.
 It's idempotent — safe to re-run any time (rules are replaced, not stacked).
 
 Opening pools for assets held before the tracked tax year start
@@ -132,8 +145,7 @@ the basis they arrived with).
 python src/cgt_ledger.py                   # sync from APIs + recompute
 python src/cgt_ledger.py --dry-run         # preview without writing
 python src/cgt_ledger.py --recompute-only  # skip APIs, just recompute
-python src/cgt_ledger.py --sort            # also physically re-sort rows by date
-python src/cgt_ledger.py --migrate         # refresh formatting on an existing tab (idempotent)
+python src/cgt_ledger.py --migrate         # refresh formatting/layout on an existing tab (idempotent)
 ```
 
 Runs daily via cron at 8:30am (see `config/crontab.example`), separate from
@@ -144,15 +156,12 @@ un-logged disposal, gift, or transfer to self-custody), that's never
 auto-written to the sheet — only a console warning, since it's not always a
 taxable event and shouldn't be guessed at.
 
-The tax-year summary (disposals, proceeds, gains vs the annual exempt
-amount, reward income) lives on its own `CGT Summary` tab — it can't sit
-beside the ledger data because the row filter hides whole rows.
-
 Staking-reward and transfer rows are kept in the data — rewards carry pool
 units/cost basis and take part in 30-day matching; transfers anchor dedupe
 and reconciliation — but they're hidden from view by the tab's basic filter
-(re-applied each run, so unhiding lasts until the next sync). The tax year's
-total reward income appears in the summary block for self-assessment.
+(re-applied each run, bounded to the data rows so the summary block below is
+never hidden; unhiding lasts until the next sync). Each tax year's total
+reward income appears in the summary block for self-assessment.
 
 ## Project structure
 

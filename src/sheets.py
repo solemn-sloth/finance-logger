@@ -115,6 +115,33 @@ def append_rows(sheet_id: str, tab: str, rows: list[list], raw: bool = True) -> 
     ).execute()
 
 
+def insert_rows(sheet_id: str, tab: str, start_index: int, count: int,
+                inherit_from_before: bool = True) -> None:
+    """
+    Insert `count` blank grid rows at 0-based `start_index` (rows at and below
+    it shift down). inherit_from_before=True copies formatting from the row
+    above — unlike values.append INSERT_ROWS, which creates unformatted rows.
+    """
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"insertDimension": {
+            "range": {"sheetId": gid, "dimension": "ROWS",
+                      "startIndex": start_index, "endIndex": start_index + count},
+            "inheritFromBefore": inherit_from_before,
+        }}]},
+    ).execute()
+
+
+def clear_range(sheet_id: str, tab: str, a1: str) -> None:
+    """Clear values in a range (formatting untouched)."""
+    service = get_sheet_service()
+    service.spreadsheets().values().clear(
+        spreadsheetId=sheet_id, range=f"'{tab}'!{a1}"
+    ).execute()
+
+
 def ensure_tab(sheet_id: str, tab: str) -> bool:
     """Create the tab if it doesn't exist. Returns True if created."""
     service = get_sheet_service()
@@ -244,23 +271,39 @@ def replace_all_conditional_format_rules(sheet_id: str, tab: str, rules: list[di
         ).execute()
 
 
-def set_basic_filter(sheet_id: str, tab: str, hidden_by_col: dict[int, list[str]]) -> None:
+def set_basic_filter(sheet_id: str, tab: str, hidden_by_col: dict[int, list[str]],
+                     end_row_index: int | None = None) -> None:
     """
     Set the tab's basic filter, hiding the given values per column (0-indexed).
-    Replaces any existing basic filter; open-ended range so it covers rows
-    appended later.
+    Replaces any existing basic filter. end_row_index (0-based exclusive)
+    bounds the range so rows below it — e.g. a summary block — are untouched;
+    None leaves it open-ended.
     """
     service = get_sheet_service()
     gid = _get_sheet_gid(sheet_id, tab)
+    rng = {"sheetId": gid, "startRowIndex": 0}
+    if end_row_index is not None:
+        rng["endRowIndex"] = end_row_index
     service.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id,
         body={"requests": [{"setBasicFilter": {"filter": {
-            "range": {"sheetId": gid, "startRowIndex": 0},
+            "range": rng,
             "filterSpecs": [
                 {"columnIndex": col, "filterCriteria": {"hiddenValues": values}}
                 for col, values in hidden_by_col.items()
             ],
         }}}]},
+    ).execute()
+
+
+def clear_basic_filter(sheet_id: str, tab: str) -> None:
+    """Remove the tab's basic filter (no-op if none). Needed before repeatCell
+    formatting: formats are NOT applied to rows a basic filter hides."""
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"clearBasicFilter": {"sheetId": gid}}]},
     ).execute()
 
 
@@ -342,6 +385,28 @@ def format_column_number_format(
             "fields": "userEnteredFormat.numberFormat",
         }}]},
     ).execute()
+
+
+def apply_formats(sheet_id: str, tab: str,
+                  formats: list[tuple[dict, dict, str]]) -> None:
+    """
+    Batch-apply cell formats. Each item is (grid_range without sheetId,
+    userEnteredFormat dict, fields mask) — one batchUpdate call total.
+    """
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    requests = [
+        {"repeatCell": {
+            "range": {**rng, "sheetId": gid},
+            "cell": {"userEnteredFormat": fmt},
+            "fields": fields,
+        }}
+        for rng, fmt, fields in formats
+    ]
+    if requests:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id, body={"requests": requests}
+        ).execute()
 
 
 def update_cell(sheet_id: str, tab: str, cell: str, value) -> None:

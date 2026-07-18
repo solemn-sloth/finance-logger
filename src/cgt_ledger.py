@@ -11,13 +11,23 @@ columns O-T for every row using UK share-matching rules: same-day,
 
 Input columns are never rewritten, so manual rows always survive.
 
+Layout — everything lives on the one tab:
+  row 1            headers (frozen)
+  rows 2..D        data rows, physically sorted by date (grouped by tax year)
+  row D+1          blank spacer (formatted like a data row — the template that
+                   inserted rows inherit their formatting from)
+  row D+2          'CGT SUMMARY' marker row
+  next 13 rows     summary block: labels in column A, one column per tax year,
+                   including the loss carry-forward chain across years
+Rows below the block are never touched.
+
 Usage:
   python3 src/cgt_ledger.py                 # sync from APIs + recompute
   python3 src/cgt_ledger.py --setup         # one-time: create tab, headers, formats
-  python3 src/cgt_ledger.py --migrate       # one-time: apply new formatting to an existing tab
+  python3 src/cgt_ledger.py --migrate       # convert/refresh an existing tab in place
   python3 src/cgt_ledger.py --dry-run       # print what would change, write nothing
   python3 src/cgt_ledger.py --recompute-only  # skip APIs, recompute existing rows
-  python3 src/cgt_ledger.py --sort          # also physically re-sort rows by date
+  python3 src/cgt_ledger.py --sort          # deprecated no-op (sorting is default now)
 
 Manual row conventions:
   - Opening Section 104 pool (holdings pre-dating the tax year): one row per
@@ -73,7 +83,6 @@ HEADERS = [
 N_INPUT_COLS = 14   # A-N
 N_COLS = 20         # A-T
 
-ANNUAL_EXEMPT_AMOUNT = Decimal("3000")
 PROCEEDS_REPORTING_THRESHOLD = Decimal("50000")
 RECONCILE_TOLERANCE = Decimal("0.000001")
 WARNING_MARK = "⚠ "
@@ -947,102 +956,204 @@ def reconcile_holdings(
 # Sheet I/O
 # ---------------------------------------------------------------------------
 
-def read_ledger_rows(sheet_id: str, tab: str) -> list[Row]:
-    # Unformatted read: user display formats (e.g. 2dp on quantity columns)
-    # must never round the values the engine computes with.
+SUMMARY_MARKER = "CGT SUMMARY"
+SUMMARY_BLOCK_HEIGHT = 14
+
+
+def read_ledger(sheet_id: str, tab: str) -> tuple[list[Row], int | None]:
+    """
+    Read data rows and locate the summary block.
+
+    Returns (rows, marker_row): marker_row is the 1-based sheet row whose
+    column A equals SUMMARY_MARKER, or None when the block doesn't exist yet
+    (first run / pre-migration layout). Rows below the block are ignored
+    (with a warning if they hold anything).
+
+    Unformatted read: user display formats (e.g. 2dp on quantity columns)
+    must never round the values the engine computes with.
+    """
     values = sheets.read_range(sheet_id, tab, "A2:N", unformatted=True)
-    rows = []
+    rows: list[Row] = []
+    marker_row = None
     for i, cells in enumerate(values):
+        if cells and str(cells[0]).strip() == SUMMARY_MARKER:
+            marker_row = i + 2
+            break
         row = parse_row(i + 2, cells)
         if row:
             rows.append(row)
-    return rows
+    if marker_row is not None:
+        below = marker_row - 2 + SUMMARY_BLOCK_HEIGHT
+        for j, cells in enumerate(values[below:]):
+            if any(str(c).strip() for c in cells):
+                print(f"WARN: row {below + j + 2} is below the summary block and is "
+                      f"ignored — move transactions above the '{SUMMARY_MARKER}' row.",
+                      file=sys.stderr)
+    return rows, marker_row
 
 
-def write_computed(sheet_id: str, tab: str, rows: list[Row],
-                   computed: dict[int, Computed]) -> None:
-    if not rows:
-        return
-    last = max(r.idx for r in rows)
-    block = [[""] * 6 for _ in range(last - 1)]  # rows 2..last, cols O-T
+def _date_serial(dt: datetime) -> int:
+    """Europe/London calendar date as a Sheets date serial — written RAW it
+    stays a real Date cell and takes the column's display format."""
+    return (dt.astimezone(LONDON).date() - _SHEETS_EPOCH.date()).days
+
+
+def write_sorted_data(sheet_id: str, tab: str, rows: list[Row],
+                      computed: dict[int, Computed], region_end: int) -> None:
+    """
+    Rewrite the whole data region A2:T{region_end} with rows in date order:
+    input cells verbatim from Row.raw (dates normalised to real Date cells —
+    the one narrow exception; BAD DATE text is preserved for the user to fix)
+    plus computed O-T. region_end is the last 1-based row of the region (the
+    spacer row when a summary block exists); slack rows are blank-filled.
+
+    Rows must already be sorted with idx reassigned from 2, and `computed`
+    keyed to those idx values.
+    """
+    block = []
     for r in rows:
         c = computed[r.idx]
-        block[r.idx - 2] = [
+        if r.dt is not None and "BAD DATE" not in r.warning:
+            first = _date_serial(r.dt)
+        else:
+            first = r.raw[0] if r.raw else ""
+        inputs = list(r.raw[1:] if r.raw else row_to_cells(r)[1:])
+        inputs += [""] * (N_INPUT_COLS - 1 - len(inputs))
+        # numeric input cells stored as text (e.g. a legacy "£0.40") become
+        # real numbers so £/qty formats and SUMs work; same value either way
+        for ci in (2, 4, 5, 7, 11):  # D, F, G, I, M relative to B
+            if isinstance(inputs[ci], str) and inputs[ci].strip():
+                try:
+                    inputs[ci] = float(_dec(inputs[ci]))
+                except Exception:
+                    pass  # genuinely non-numeric text: keep verbatim
+        block.append([first] + inputs + [
             c.match,
             _num(c.pool_before[0], 8) if c.pool_before else "",
             _num(c.pool_before[1]) if c.pool_before else "",
             _num(c.pool_after[0], 8) if c.pool_after else "",
             _num(c.pool_after[1]) if c.pool_after else "",
             _num(c.gain),
-        ]
-    sheets.write_range(sheet_id, tab, f"O2:T{last}", block)
+        ])
+    while len(block) < region_end - 1:
+        block.append([""] * N_COLS)
+    if block:
+        sheets.write_range(sheet_id, tab, f"A2:T{len(block) + 1}", block)
 
 
-def write_dates(sheet_id: str, tab: str, rows: list[Row]) -> None:
+# ---------------------------------------------------------------------------
+# Tax-year summary with loss carry-forward
+# ---------------------------------------------------------------------------
+
+def tax_year_of(d: date) -> int:
+    """UK tax year (its starting year) containing d: 5 Apr 2026 -> 2025,
+    6 Apr 2026 -> 2026."""
+    return d.year if (d.month, d.day) >= (4, 6) else d.year - 1
+
+
+def tax_year_label(year: int) -> str:
+    return f"{year}/{str(year + 1)[2:]}"
+
+
+def aea_for(year: int) -> Decimal:
+    """CGT annual exempt amount for the tax year starting 6 April `year`."""
+    if year >= 2024:
+        return Decimal("3000")
+    if year == 2023:
+        return Decimal("6000")
+    return Decimal("12300")
+
+
+@dataclass
+class YearSummary:
+    year: int                 # tax year starting 6 April `year`
+    disposals: int
+    proceeds: Decimal
+    gains: Decimal
+    losses: Decimal           # negative
+    net: Decimal
+    losses_bf: Decimal        # loss pool available at the start of the year
+    losses_bf_used: Decimal
+    aea: Decimal
+    taxable: Decimal
+    losses_cf: Decimal        # carried into the next year
+    reward_income: Decimal
+
+
+def summarise_years(rows: list[Row], computed: dict[int, Computed],
+                    losses_bf: Decimal = Decimal(0),
+                    today: date | None = None) -> list[YearSummary]:
     """
-    Normalize column A's representation to a real Sheets Date (see date_str),
-    for every row with a valid dt. This is a deliberate, narrow exception to
-    "input columns are never rewritten": it only changes how a date displays,
-    never what date a row represents. Rows with a BAD DATE warning are left
-    untouched — never overwrite unparseable text the user needs to fix by hand.
-
-    Also reapplies the dd/mm/yy number format on every run: rows appended via
-    INSERT_ROWS don't inherit formatting set on the column by --setup/--migrate
-    (they're new grid rows), so without this they'd fall back to Sheets'
-    auto-inferred yyyy-mm-dd format. repeatCell formatting is idempotent —
-    safe to reapply every run (unlike the conditional-format rule).
+    Per-tax-year totals with the UK loss carry-forward chain: current-year
+    losses offset current-year gains first (mandatory); brought-forward losses
+    then reduce net gains only down to the AEA (never wasted below it); the
+    remainder carries into the next year. Years are contiguous from the first
+    disposal/reward through today's tax year so the chain flows through empty
+    years. losses_bf seeds the pool with pre-ledger losses (CGT_LOSSES_BF).
     """
-    if not rows:
-        return
-    last = max(r.idx for r in rows)
-    block = [[""] for _ in range(last - 1)]
-    for r in rows:
-        if r.dt is not None and "BAD DATE" not in r.warning:
-            block[r.idx - 2] = [date_str(r.dt)]
-        elif r.raw:
-            block[r.idx - 2] = [r.raw[0]]  # unparseable: leave the user's text untouched
-    sheets.write_range(sheet_id, tab, f"A2:A{last}", block, raw=False)
-    sheets.format_column_number_format(sheet_id, tab, 0, 1, "dd/mm/yy")
+    today = today or datetime.now(LONDON).date()
+
+    def ty(r: Row) -> int:
+        return tax_year_of(r.dt.astimezone(LONDON).date())
+
+    relevant = [r for r in rows if r.dt
+                and (r.type in DISPOSAL_TYPES or r.type == "REWARD")]
+    current = tax_year_of(today)
+    first = min((ty(r) for r in relevant), default=current)
+    last = max([current] + [ty(r) for r in relevant])
+
+    out: list[YearSummary] = []
+    pool = losses_bf
+    for year in range(first, last + 1):
+        disposals = [r for r in rows
+                     if r.type in DISPOSAL_TYPES and r.dt and ty(r) == year]
+        proceeds = sum((r.value_gbp or Decimal(0) for r in disposals), Decimal(0))
+        gains = sum((computed[r.idx].gain for r in disposals
+                     if computed[r.idx].gain and computed[r.idx].gain > 0), Decimal(0))
+        losses = sum((computed[r.idx].gain for r in disposals
+                      if computed[r.idx].gain and computed[r.idx].gain < 0), Decimal(0))
+        net = gains + losses
+        aea = aea_for(year)
+        if net > 0:
+            bf_used = min(pool, max(Decimal(0), net - aea))
+            taxable = max(Decimal(0), net - bf_used - aea)
+            cf = pool - bf_used
+        else:
+            bf_used = Decimal(0)
+            taxable = Decimal(0)
+            cf = pool - net
+        reward_income = sum(
+            ((r.income_taxed if r.income_taxed is not None else r.value_gbp) or Decimal(0)
+             for r in rows if r.type == "REWARD" and r.dt and ty(r) == year),
+            Decimal(0),
+        )
+        out.append(YearSummary(year, len(disposals), proceeds, gains, losses, net,
+                               pool, bf_used, aea, taxable, cf, reward_income))
+        pool = cf
+    return out
 
 
-def tax_year_window(start: date) -> tuple[date, date]:
-    return start, date(start.year + 1, start.month, start.day) - timedelta(days=1)
-
-
-def summarise(rows: list[Row], computed: dict[int, Computed],
-              ty_start: date, ty_end: date) -> list[list]:
-    disposals = [r for r in rows
-                 if r.type in DISPOSAL_TYPES and r.dt
-                 and ty_start <= r.dt.astimezone(LONDON).date() <= ty_end]
-    proceeds = sum((r.value_gbp or Decimal(0) for r in disposals), Decimal(0))
-    gains = sum((computed[r.idx].gain for r in disposals
-                 if computed[r.idx].gain and computed[r.idx].gain > 0), Decimal(0))
-    losses = sum((computed[r.idx].gain for r in disposals
-                  if computed[r.idx].gain and computed[r.idx].gain < 0), Decimal(0))
-    net = gains + losses
-    taxable = max(Decimal(0), net - ANNUAL_EXEMPT_AMOUNT)
-    aea_left = max(Decimal(0), ANNUAL_EXEMPT_AMOUNT - max(net, Decimal(0)))
-    reward_income = sum(
-        ((r.income_taxed if r.income_taxed is not None else r.value_gbp) or Decimal(0)
-         for r in rows
-         if r.type == "REWARD" and r.dt
-         and ty_start <= r.dt.astimezone(LONDON).date() <= ty_end),
-        Decimal(0),
-    )
+def build_summary_block(years: list[YearSummary], now: datetime) -> list[list]:
+    """The 14-row summary block (marker row included): labels in column A,
+    one column per tax year. Numeric cells are numbers, never strings."""
+    def per(fn):
+        return [fn(y) for y in years]
     return [
-        ["Tax year", f"{ty_start.year}/{str(ty_end.year)[2:]} ({ty_start} to {ty_end})"],
-        ["Disposals", len(disposals)],
-        ["Total proceeds (GBP)", _num(proceeds)],
-        ["Total gains (GBP)", _num(gains)],
-        ["Total losses (GBP)", _num(losses)],
-        ["Net gain/loss (GBP)", _num(net)],
-        ["Annual exempt amount", _num(ANNUAL_EXEMPT_AMOUNT)],
-        ["AEA remaining", _num(aea_left)],
-        ["Taxable gain after AEA", _num(taxable)],
-        ["Proceeds > £50k (report even if no tax due)",
-         "YES" if proceeds > PROCEEDS_REPORTING_THRESHOLD else "NO"],
-        ["Reward income (GBP, taxed at receipt)", _num(reward_income)],
-        ["Last updated (UTC)", iso(datetime.now(UTC))],
+        [SUMMARY_MARKER, "Last updated (UTC)", iso(now)],
+        ["Tax year"] + per(lambda y: tax_year_label(y.year)),
+        ["Disposals"] + per(lambda y: y.disposals),
+        ["Total proceeds"] + per(lambda y: _num(y.proceeds)),
+        ["Total gains"] + per(lambda y: _num(y.gains)),
+        ["Total losses"] + per(lambda y: _num(y.losses)),
+        ["Net gain/loss"] + per(lambda y: _num(y.net)),
+        ["Losses b/f available"] + per(lambda y: _num(y.losses_bf)),
+        ["Losses b/f used"] + per(lambda y: _num(y.losses_bf_used)),
+        ["Annual exempt amount"] + per(lambda y: _num(y.aea)),
+        ["Taxable gain (after losses + AEA)"] + per(lambda y: _num(y.taxable)),
+        ["Losses carried forward"] + per(lambda y: _num(y.losses_cf)),
+        ["Proceeds > £50k (report even if no tax due)"]
+        + per(lambda y: "YES" if y.proceeds > PROCEEDS_REPORTING_THRESHOLD else "NO"),
+        ["Reward income (taxed at receipt)"] + per(lambda y: _num(y.reward_income)),
     ]
 
 
@@ -1098,8 +1209,19 @@ CONDITIONAL_RULES = [
     _gain_color_rule("NUMBER_LESS", _RED),
 ]
 
+def conditional_rules(data_end: int) -> list[dict]:
+    """CONDITIONAL_RULES bounded to the data rows (0-based exclusive
+    data_end), so they never touch the summary block below."""
+    rules = []
+    for rule in CONDITIONAL_RULES:
+        rule = dict(rule)
+        rule["ranges"] = [{**rng, "endRowIndex": data_end} for rng in rule["ranges"]]
+        rules.append(rule)
+    return rules
+
+
 HEADER_NOTES = {
-    "A1": "Transaction date, dd/mm/yy (Europe/London calendar day; time not tracked).",
+    "A1": "Transaction date, dd/mm/yyyy (Europe/London calendar day; time not tracked).",
     "L1": ("Txn ID — the sync's dedupe key (stops the daily run re-importing the same "
            "transaction). Leave blank for manual rows, or use MANUAL:<anything-unique>."),
     "M1": ("Income already taxed (GBP) — for RSU vests and staking rewards: the amount "
@@ -1114,96 +1236,145 @@ HEADER_NOTES = {
 }
 
 
-SUMMARY_TAB_DEFAULT = "CGT Summary"
+_SUMMARY_FILL = {"red": 0.92, "green": 0.92, "blue": 0.92}
+_CURRENCY_FMT = {"numberFormat": {"type": "CURRENCY", "pattern": "£#,##0.00"}}
 
 
-def _summary_tab() -> str:
-    return os.getenv("CGT_SUMMARY_TAB", SUMMARY_TAB_DEFAULT)
+def write_summary(sheet_id: str, tab: str, marker_row: int,
+                  years: list[YearSummary], now: datetime | None = None) -> None:
+    """Write the summary block at A{marker_row} and style it (banner fill,
+    bold labels/year headers, £ formats). Block-bounded and idempotent —
+    overrides any data-column formats bleeding into these rows."""
+    block = build_summary_block(years, now or datetime.now(UTC))
+    sheets.write_range(sheet_id, tab, f"A{marker_row}", block)
+    m0 = marker_row - 1  # 0-based
+    ncols = 1 + len(years)
+    bold = {"textFormat": {"bold": True}}
+    sheets.apply_formats(sheet_id, tab, [
+        # banner: bold + grey fill across the block width (min 3 cols for the
+        # "Last updated" cells)
+        ({"startRowIndex": m0, "endRowIndex": m0 + 1,
+          "startColumnIndex": 0, "endColumnIndex": max(ncols, 3)},
+         {**bold, "backgroundColor": _SUMMARY_FILL},
+         "userEnteredFormat(textFormat.bold,backgroundColor)"),
+        # label column
+        ({"startRowIndex": m0 + 1, "endRowIndex": m0 + SUMMARY_BLOCK_HEIGHT,
+          "startColumnIndex": 0, "endColumnIndex": 1},
+         bold, "userEnteredFormat.textFormat.bold"),
+        # year header row
+        ({"startRowIndex": m0 + 1, "endRowIndex": m0 + 2,
+          "startColumnIndex": 1, "endColumnIndex": ncols},
+         bold, "userEnteredFormat.textFormat.bold"),
+        # Disposals: plain integers
+        ({"startRowIndex": m0 + 2, "endRowIndex": m0 + 3,
+          "startColumnIndex": 1, "endColumnIndex": ncols},
+         {"numberFormat": {"type": "NUMBER", "pattern": "0"}},
+         "userEnteredFormat.numberFormat"),
+        # currency: Total proceeds .. Losses carried forward
+        ({"startRowIndex": m0 + 3, "endRowIndex": m0 + 12,
+          "startColumnIndex": 1, "endColumnIndex": ncols},
+         _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+        # currency: Reward income
+        ({"startRowIndex": m0 + 13, "endRowIndex": m0 + SUMMARY_BLOCK_HEIGHT,
+          "startColumnIndex": 1, "endColumnIndex": ncols},
+         _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+    ])
 
 
-def _apply_summary_formatting(sheet_id: str) -> None:
-    """Create + format the summary tab. The summary can't live on the ledger
-    tab: the row filter hides whole grid rows, taking any side columns with
-    them. Idempotent."""
-    tab = _summary_tab()
-    sheets.ensure_tab(sheet_id, tab)
-    sheets.set_column_width(sheet_id, tab, 0, 310)
-    sheets.set_column_width(sheet_id, tab, 1, 160)
-    sheets.format_range_bold(
-        sheet_id, tab, {"startRowIndex": 0, "startColumnIndex": 0, "endColumnIndex": 1}
-    )
-    # currency from "Total proceeds" (row 3) down — number formats don't touch
-    # the text cells (YES/NO flag, timestamp) and skip the Disposals count above
-    sheets.format_column_number_format(sheet_id, tab, 1, 2, "£#,##0.00", "CURRENCY")
+def apply_dynamic_bounds(sheet_id: str, tab: str, n_data: int) -> None:
+    """Re-pin the conditional-format rules and row filter, bounded to the
+    current data rows so the summary block is never highlighted or hidden."""
+    data_end = n_data + 1  # 0-based exclusive: header row 0 + n_data rows
+    rules = conditional_rules(data_end) if n_data else []  # empty range = API 400
+    sheets.replace_all_conditional_format_rules(sheet_id, tab, rules)
+    if n_data:
+        sheets.set_basic_filter(sheet_id, tab, {1: HIDDEN_ROW_TYPES},
+                                end_row_index=data_end)
 
 
-def _apply_formatting(sheet_id: str, tab: str) -> None:
-    """Full tab formatting. Everything here is idempotent — safe to re-run."""
+def _col_range(col: int, end_row: int) -> dict:
+    return {"startRowIndex": 1, "endRowIndex": end_row,
+            "startColumnIndex": col, "endColumnIndex": col + 1}
+
+
+def _apply_formatting(sheet_id: str, tab: str, data_end: int) -> None:
+    """Static tab formatting, bounded to rows 2..data_end (0-based exclusive
+    — pass n_data+2 so the spacer row is included and stays a valid format
+    template for inherited row inserts). Idempotent. Row-level formats are
+    only needed here (setup/migrate): normal runs insert rows with
+    inheritFromBefore, which copies the neighbouring row's formats, so the
+    user can restyle columns and the script respects it."""
     sheets.write_range(sheet_id, tab, "A1:T1", [HEADERS])
     sheets.freeze_rows(sheet_id, tab, 1)
-    for col in range(14, 20):  # grey the computed columns O-T
-        sheets.format_column_text_color(sheet_id, tab, col, 1, (0.45, 0.45, 0.45))
-    sheets.format_column_number_format(sheet_id, tab, 0, 1, "dd/mm/yy")
+    grey = {"textFormat": {"foregroundColor": {"red": 0.45, "green": 0.45, "blue": 0.45}}}
+    formats = [(_col_range(col, data_end), grey,
+                "userEnteredFormat.textFormat.foregroundColor")
+               for col in range(14, 20)]  # grey the computed columns O-T
+    formats.append((_col_range(0, data_end),
+                    {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}},
+                    "userEnteredFormat.numberFormat"))
     for col in (3, 5, 15, 17):  # quantity columns: full precision, no fake 0.00
-        sheets.format_column_number_format(sheet_id, tab, col, 1, "0.########", "NUMBER")
+        formats.append((_col_range(col, data_end),
+                        {"numberFormat": {"type": "NUMBER", "pattern": "0.########"}},
+                        "userEnteredFormat.numberFormat"))
     for col in (6, 8, 12, 16, 18, 19):  # GBP columns
-        sheets.format_column_number_format(sheet_id, tab, col, 1, "£#,##0.00", "CURRENCY")
-    sheets.replace_all_conditional_format_rules(sheet_id, tab, CONDITIONAL_RULES)
-    sheets.set_basic_filter(sheet_id, tab, {1: HIDDEN_ROW_TYPES})
+        formats.append((_col_range(col, data_end), _CURRENCY_FMT,
+                        "userEnteredFormat.numberFormat"))
+    sheets.apply_formats(sheet_id, tab, formats)
     sheets.set_column_hidden(sheet_id, tab, 11)  # Txn ID: machine bookkeeping
     for cell, note in HEADER_NOTES.items():
         col = ord(cell[0]) - ord("A")
         sheets.set_cell_note(sheet_id, tab, int(cell[1:]) - 1, col, note)
 
 
-def setup_tab(sheet_id: str, tab: str) -> None:
+def setup_tab(sheet_id: str, tab: str, losses_bf: Decimal) -> None:
     created = sheets.ensure_tab(sheet_id, tab)
-    _apply_formatting(sheet_id, tab)
-    _apply_summary_formatting(sheet_id)
-    print(f"Tab '{tab}' {'created' if created else 'already existed'}; formatting applied.")
-
-
-def migrate_formatting(sheet_id: str, tab: str) -> None:
-    """Bring an existing tab up to date with current formatting. Idempotent."""
-    _apply_formatting(sheet_id, tab)
-    _apply_summary_formatting(sheet_id)
-    # summary used to live in V1:W12 on the ledger tab; clear any remnants
-    sheets.write_range(sheet_id, tab, "V1:W12", [["", ""]] * 12)
-    print(f"Formatting refreshed for tab '{tab}' (+ summary tab).")
+    _apply_formatting(sheet_id, tab, data_end=2)  # row 2 = spacer/template
+    write_summary(sheet_id, tab, 3, summarise_years([], {}, losses_bf=losses_bf))
+    apply_dynamic_bounds(sheet_id, tab, 0)
+    print(f"Tab '{tab}' {'created' if created else 'already existed'}; "
+          f"formatting + summary block applied.")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def _print_summary(years: list[YearSummary]) -> None:
+    block = build_summary_block(years, datetime.now(UTC))
+    for line in block[1:]:
+        print("  " + str(line[0]).ljust(44)
+              + "  ".join(f"{v!s:>12}" for v in line[1:]))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="UK CGT ledger sync + compute")
     parser.add_argument("--setup", action="store_true")
     parser.add_argument("--migrate", action="store_true",
-                        help="one-time: apply new formatting to an existing tab")
+                        help="convert/refresh an existing tab in place (idempotent)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--recompute-only", action="store_true")
     parser.add_argument("--sort", action="store_true",
-                        help="physically re-sort sheet rows by date (full rewrite)")
+                        help="deprecated no-op: rows are sorted by date every run")
     args = parser.parse_args()
 
     sheet_id = os.environ["GOOGLE_SHEET_ID"]
     tab = os.getenv("CGT_SHEET_TAB", "CGT Ledger")
     ty_start = date.fromisoformat(os.getenv("CGT_TAX_YEAR_START", "2026-04-06"))
-    ty_end = tax_year_window(ty_start)[1]
     since = datetime(ty_start.year, ty_start.month, ty_start.day, tzinfo=UTC)
+    losses_bf = _dec(os.getenv("CGT_LOSSES_BF"), Decimal(0))
 
     if args.setup:
-        setup_tab(sheet_id, tab)
+        setup_tab(sheet_id, tab, losses_bf)
         return
+
+    rows, marker = read_ledger(sheet_id, tab)
+    known = {r.txid for r in rows if r.txid}
+    print(f"{len(rows)} existing rows in '{tab}'"
+          + ("" if marker else " (no summary block yet — will be created)"))
 
     if args.migrate:
-        migrate_formatting(sheet_id, tab)
-        return
-
-    rows = read_ledger_rows(sheet_id, tab)
-    known = {r.txid for r in rows if r.txid}
-    print(f"{len(rows)} existing rows in '{tab}'")
+        args.recompute_only = True  # formatting happens after the filter clear below
 
     new_rows: list[Row] = []
     if not args.recompute_only:
@@ -1216,83 +1387,83 @@ def main() -> None:
                 print(f"{name}: {len(fetched)} transactions, {len(fresh)} new")
             except Exception as exc:
                 print(f"WARN: {name} fetch failed, skipping source: {exc}", file=sys.stderr)
-        new_rows.sort(key=lambda r: r.dt)
-
-    if new_rows:
-        if args.dry_run:
-            print("Would append:")
-            for r in new_rows:
-                print("  ", row_to_cells(r))
-        else:
-            next_idx = (max(r.idx for r in rows) + 1) if rows else 2
-            for i, r in enumerate(new_rows):
-                r.idx = next_idx + i
-            sheets.append_rows(sheet_id, tab, [row_to_cells(r) for r in new_rows])
-            rows.extend(new_rows)
-            print(f"Appended {len(new_rows)} rows")
 
     # Reconciliation (pass-1 pools feed it; needs live APIs)
     to_append: list[Row] = []
     to_replace: list[Row] = []
     if not args.recompute_only:
-        _, asset_pools = compute_cgt(rows)
+        _, asset_pools = compute_cgt(rows + new_rows)
         holdings = fetch_current_holdings()
-        to_append, to_replace = reconcile_holdings(rows, asset_pools, holdings, ty_start)
+        to_append, to_replace = reconcile_holdings(rows + new_rows, asset_pools,
+                                                   holdings, ty_start)
 
     if args.dry_run:
         computed, _ = compute_cgt(rows)
-        summary = summarise(rows, computed, ty_start, ty_end)
         print("Summary (existing rows only):")
-        for label, value in summary:
-            print(f"  {label}: {value}")
-        for verb, batch in (("append", to_append), ("update in place", to_replace)):
+        _print_summary(summarise_years(rows, computed, losses_bf=losses_bf))
+        for verb, batch in (("append", new_rows + to_append),
+                            ("update in place", to_replace)):
             if batch:
                 print(f"Would {verb}:")
                 for r in batch:
                     print("  ", row_to_cells(r))
         return
 
-    # Apply reconciliation results (all row mutations happen BEFORE final compute)
+    # Filter off while writing: repeatCell formatting skips filter-hidden rows,
+    # so every write/format below runs unfiltered; re-set at the end.
+    sheets.clear_basic_filter(sheet_id, tab)
+
+    if args.migrate:
+        # data region + spacer get the static formats; then fall through to the
+        # normal recompute path, which sorts, writes the block and re-pins bounds
+        _apply_formatting(sheet_id, tab, data_end=len(rows) + 2)
+        sheets.clear_range(sheet_id, tab, "V1:W12")  # legacy on-tab summary remnant
+
+    # Apply reconciliation results in memory only — the full sorted rewrite
+    # below persists everything in one write.
     if to_replace:
         by_idx = {r.idx: r for r in to_replace}
         rows = [by_idx.get(r.idx, r) for r in rows]
-        for r in to_replace:
-            sheets.write_range(sheet_id, tab, f"A{r.idx}:N{r.idx}", [row_to_cells(r)])
-        print(f"Updated {len(to_replace)} stub row(s) in place: "
+        print(f"Updated {len(to_replace)} stub row(s): "
               + ", ".join(r.asset_in for r in to_replace))
-    if to_append:
-        next_idx = (max(r.idx for r in rows) + 1) if rows else 2
-        for i, r in enumerate(to_append):
-            r.idx = next_idx + i
-        sheets.append_rows(sheet_id, tab, [row_to_cells(r) for r in to_append])
-        rows.extend(to_append)
-        print(f"Added {len(to_append)} holding row(s): "
-              + ", ".join(r.asset_in for r in to_append))
 
-    if args.sort and rows:
-        rows.sort(key=lambda r: (r.dt or datetime.max.replace(tzinfo=UTC)))
-        for i, r in enumerate(rows):
-            r.idx = i + 2
-        full = [
-            [date_str(r.dt) if r.dt else (r.raw[0] if r.raw else "")]
-            + (r.raw[1:] if r.raw else row_to_cells(r)[1:])
-            + [""] * 6
-            for r in rows
-        ]
-        sheets.write_range(sheet_id, tab, f"A2:T{len(rows) + 1}", full)
+    added = new_rows + to_append
+    if added:
+        if marker is not None:
+            # make room between the last data row and the spacer; inserted grid
+            # rows inherit the last data row's formatting (or the spacer's on an
+            # empty ledger), so user restyling carries over to new rows
+            last_data = max((r.idx for r in rows), default=1)
+            sheets.insert_rows(sheet_id, tab, last_data, len(added),
+                               inherit_from_before=bool(rows))
+            marker += len(added)
+        base = max((r.idx for r in rows), default=1) + 1
+        for i, r in enumerate(added):
+            r.idx = base + i
+        rows.extend(added)
+        if new_rows:
+            print(f"Appended {len(new_rows)} new transaction row(s)")
+        if to_append:
+            print(f"Added {len(to_append)} holding row(s): "
+                  + ", ".join(r.asset_in for r in to_append))
 
-    # Final compute AFTER every row mutation, so O-T always aligns with rows
+    # Sort by date (groups rows by tax year), reindex, then the final compute
+    # AFTER every row mutation so O-T always aligns with rows
+    rows.sort(key=lambda r: (r.dt or datetime.max.replace(tzinfo=UTC)))
+    for i, r in enumerate(rows):
+        r.idx = i + 2
     computed, _ = compute_cgt(rows)
 
-    write_dates(sheet_id, tab, rows)
-    write_computed(sheet_id, tab, rows, computed)
-    sheets.replace_all_conditional_format_rules(sheet_id, tab, CONDITIONAL_RULES)
-    sheets.set_basic_filter(sheet_id, tab, {1: HIDDEN_ROW_TYPES})
-    summary = summarise(rows, computed, ty_start, ty_end)
-    sheets.write_range(sheet_id, _summary_tab(), f"A1:B{len(summary)}", summary)
-    print("Computed columns + summary written.")
-    net = summary[5][1]
-    print(f"Net gain/loss this tax year: £{net}")
+    region_end = (marker - 1) if marker is not None else (len(rows) + 1)
+    write_sorted_data(sheet_id, tab, rows, computed, region_end)
+
+    years = summarise_years(rows, computed, losses_bf=losses_bf)
+    marker_row = marker if marker is not None else len(rows) + 3
+    write_summary(sheet_id, tab, marker_row, years)
+    apply_dynamic_bounds(sheet_id, tab, len(rows))
+    latest = years[-1]
+    print(f"Computed columns + summary written. {tax_year_label(latest.year)}: "
+          f"net £{latest.net:.2f}, losses c/f £{latest.losses_cf:.2f}")
 
 
 if __name__ == "__main__":

@@ -6,13 +6,16 @@ Run: python3 tests/test_cgt_engine.py
 """
 
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from cgt_ledger import Row, compute_cgt
+from cgt_ledger import (
+    SUMMARY_BLOCK_HEIGHT, SUMMARY_MARKER, Row, aea_for, build_summary_block,
+    compute_cgt, summarise_years, tax_year_of,
+)
 
 _IDX = [0]
 
@@ -149,6 +152,134 @@ def test_missing_value_flagged_and_skipped():
     assert c[rows[0].idx].match == "⚠ MISSING VALUE", c[rows[0].idx].match
     # the BUY never entered the pool, so the SELL has nothing to match against
     assert "SHORTFALL" in c[rows[1].idx].match, c[rows[1].idx].match
+
+
+def _years(rows, losses_bf="0", today=date(2026, 7, 1)):
+    c, _ = compute_cgt(rows)
+    return summarise_years(rows, c, losses_bf=Decimal(losses_bf), today=today)
+
+
+def test_tax_year_of_boundaries():
+    assert tax_year_of(date(2026, 4, 5)) == 2025
+    assert tax_year_of(date(2026, 4, 6)) == 2026
+    assert tax_year_of(date(2026, 1, 15)) == 2025
+    assert tax_year_of(date(2026, 12, 25)) == 2026
+
+
+def test_aea_for():
+    assert aea_for(2020) == Decimal("12300")
+    assert aea_for(2022) == Decimal("12300")
+    assert aea_for(2023) == Decimal("6000")
+    assert aea_for(2024) == Decimal("3000")
+    assert aea_for(2030) == Decimal("3000")
+
+
+def test_summarise_gain_under_aea():
+    rows = [
+        row("2026-04-06T00:00", "OPENING", in_a="ABC", in_q="10", value="1000"),
+        row("2026-06-01T10:00", "SELL", out_a="ABC", out_q="10", value="3000"),
+    ]
+    ys = _years(rows)
+    assert len(ys) == 1 and ys[0].year == 2026
+    y = ys[0]
+    assert y.disposals == 1 and y.proceeds == Decimal("3000")
+    assert y.net == Decimal("2000")
+    assert y.taxable == Decimal("0")
+    assert y.losses_cf == Decimal("0")
+
+
+def test_current_year_losses_offset_first():
+    # gains 5000 + losses -4000 -> net 1000 <= AEA; b/f pool untouched
+    rows = [
+        row("2026-04-06T00:00", "OPENING", in_a="AAA", in_q="1", value="1000"),
+        row("2026-05-01T10:00", "SELL", out_a="AAA", out_q="1", value="6000"),
+        row("2026-04-06T00:00", "OPENING", in_a="BBB", in_q="1", value="5000"),
+        row("2026-05-02T10:00", "SELL", out_a="BBB", out_q="1", value="1000"),
+    ]
+    y = _years(rows, losses_bf="1000")[0]
+    assert y.net == Decimal("1000"), y.net
+    assert y.losses_bf_used == Decimal("0")
+    assert y.taxable == Decimal("0")
+    assert y.losses_cf == Decimal("1000")
+
+
+def test_carry_forward_chain():
+    # year 1 (2025/26): net loss -2000; year 2 (2026/27): gain 6000
+    rows = [
+        row("2025-04-06T00:00", "OPENING", in_a="AAA", in_q="1", value="3000"),
+        row("2025-06-01T10:00", "SELL", out_a="AAA", out_q="1", value="1000"),
+        row("2026-04-06T00:00", "OPENING", in_a="BBB", in_q="1", value="1000"),
+        row("2026-06-01T10:00", "SELL", out_a="BBB", out_q="1", value="7000"),
+    ]
+    y1, y2 = _years(rows)
+    assert y1.net == Decimal("-2000") and y1.losses_cf == Decimal("2000")
+    assert y2.losses_bf == Decimal("2000")
+    assert y2.losses_bf_used == Decimal("2000")   # 6000 - 3000 AEA = 3000 headroom
+    assert y2.taxable == Decimal("1000")          # 6000 - 2000 - 3000
+    assert y2.losses_cf == Decimal("0")
+
+
+def test_bf_losses_stop_at_aea():
+    # b/f 10000, net gain 4000 -> only 1000 used (down to AEA), 9000 carried
+    rows = [
+        row("2026-04-06T00:00", "OPENING", in_a="AAA", in_q="1", value="1000"),
+        row("2026-06-01T10:00", "SELL", out_a="AAA", out_q="1", value="5000"),
+    ]
+    y = _years(rows, losses_bf="10000")[0]
+    assert y.losses_bf_used == Decimal("1000")
+    assert y.taxable == Decimal("0")
+    assert y.losses_cf == Decimal("9000")
+
+
+def test_chain_through_empty_year():
+    # loss in 2024/25, nothing in 2025/26, gain in 2026/27 — three contiguous
+    # columns, pool intact through the middle
+    rows = [
+        row("2024-05-01T00:00", "OPENING", in_a="AAA", in_q="1", value="3000"),
+        row("2024-06-01T10:00", "SELL", out_a="AAA", out_q="1", value="500"),
+        row("2026-04-06T00:00", "OPENING", in_a="BBB", in_q="1", value="1000"),
+        row("2026-06-01T10:00", "SELL", out_a="BBB", out_q="1", value="9000"),
+    ]
+    ys = _years(rows)
+    assert [y.year for y in ys] == [2024, 2025, 2026]
+    assert ys[0].losses_cf == Decimal("2500")
+    assert ys[1].disposals == 0 and ys[1].losses_bf == Decimal("2500")
+    assert ys[1].losses_cf == Decimal("2500")
+    assert ys[2].losses_bf_used == Decimal("2500")
+    assert ys[2].taxable == Decimal("2500")  # 8000 - 2500 - 3000
+
+
+def test_reward_income_split_by_year():
+    rows = [
+        row("2026-04-05T10:00", "REWARD", in_a="SOL", in_q="1", value="100", taxed="80"),
+        row("2026-04-06T10:00", "REWARD", in_a="SOL", in_q="1", value="200"),
+    ]
+    y1, y2 = _years(rows)
+    assert y1.year == 2025 and y1.reward_income == Decimal("80")   # income_taxed preferred
+    assert y2.year == 2026 and y2.reward_income == Decimal("200")  # falls back to value
+
+
+def test_build_summary_block_layout():
+    rows = [
+        row("2026-04-06T00:00", "OPENING", in_a="ABC", in_q="10", value="1000"),
+        row("2026-06-01T10:00", "SELL", out_a="ABC", out_q="10", value="3000"),
+    ]
+    ys = _years(rows)
+    block = build_summary_block(ys, datetime(2026, 7, 1, tzinfo=timezone.utc))
+    assert len(block) == SUMMARY_BLOCK_HEIGHT
+    assert block[0][0] == SUMMARY_MARKER
+    assert block[1] == ["Tax year", "2026/27"]
+    assert block[2] == ["Disposals", 1]
+    assert isinstance(block[3][1], float) and block[3][1] == 3000.0   # proceeds
+    assert block[12][1] == "NO"                                       # >50k flag
+    labels = [r[0] for r in block[1:]]
+    assert labels == [
+        "Tax year", "Disposals", "Total proceeds", "Total gains", "Total losses",
+        "Net gain/loss", "Losses b/f available", "Losses b/f used",
+        "Annual exempt amount", "Taxable gain (after losses + AEA)",
+        "Losses carried forward", "Proceeds > £50k (report even if no tax due)",
+        "Reward income (taxed at receipt)",
+    ], labels
 
 
 if __name__ == "__main__":
