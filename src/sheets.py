@@ -264,6 +264,35 @@ def set_basic_filter(sheet_id: str, tab: str, hidden_by_col: dict[int, list[str]
     ).execute()
 
 
+def set_column_width(sheet_id: str, tab: str, col: int, pixels: int) -> None:
+    """Set a column's width in pixels (0-indexed)."""
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"updateDimensionProperties": {
+            "range": {"sheetId": gid, "dimension": "COLUMNS",
+                      "startIndex": col, "endIndex": col + 1},
+            "properties": {"pixelSize": pixels},
+            "fields": "pixelSize",
+        }}]},
+    ).execute()
+
+
+def format_range_bold(sheet_id: str, tab: str, a1_range_grid: dict, bold: bool = True) -> None:
+    """Apply bold text to a grid range dict (without sheetId)."""
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"repeatCell": {
+            "range": {**a1_range_grid, "sheetId": gid},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": bold}}},
+            "fields": "userEnteredFormat.textFormat.bold",
+        }}]},
+    ).execute()
+
+
 def set_column_hidden(sheet_id: str, tab: str, col: int, hidden: bool = True) -> None:
     """Hide or unhide a column (0-indexed). Data and API access are unaffected."""
     service = get_sheet_service()

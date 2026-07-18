@@ -144,6 +144,10 @@ un-logged disposal, gift, or transfer to self-custody), that's never
 auto-written to the sheet — only a console warning, since it's not always a
 taxable event and shouldn't be guessed at.
 
+The tax-year summary (disposals, proceeds, gains vs the annual exempt
+amount, reward income) lives on its own `CGT Summary` tab — it can't sit
+beside the ledger data because the row filter hides whole rows.
+
 Staking-reward and transfer rows are kept in the data — rewards carry pool
 units/cost basis and take part in 30-day matching; transfers anchor dedupe
 and reconciliation — but they're hidden from view by the tab's basic filter

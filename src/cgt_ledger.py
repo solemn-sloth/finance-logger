@@ -1114,6 +1114,29 @@ HEADER_NOTES = {
 }
 
 
+SUMMARY_TAB_DEFAULT = "CGT Summary"
+
+
+def _summary_tab() -> str:
+    return os.getenv("CGT_SUMMARY_TAB", SUMMARY_TAB_DEFAULT)
+
+
+def _apply_summary_formatting(sheet_id: str) -> None:
+    """Create + format the summary tab. The summary can't live on the ledger
+    tab: the row filter hides whole grid rows, taking any side columns with
+    them. Idempotent."""
+    tab = _summary_tab()
+    sheets.ensure_tab(sheet_id, tab)
+    sheets.set_column_width(sheet_id, tab, 0, 310)
+    sheets.set_column_width(sheet_id, tab, 1, 160)
+    sheets.format_range_bold(
+        sheet_id, tab, {"startRowIndex": 0, "startColumnIndex": 0, "endColumnIndex": 1}
+    )
+    # currency from "Total proceeds" (row 3) down — number formats don't touch
+    # the text cells (YES/NO flag, timestamp) and skip the Disposals count above
+    sheets.format_column_number_format(sheet_id, tab, 1, 2, "£#,##0.00", "CURRENCY")
+
+
 def _apply_formatting(sheet_id: str, tab: str) -> None:
     """Full tab formatting. Everything here is idempotent — safe to re-run."""
     sheets.write_range(sheet_id, tab, "A1:T1", [HEADERS])
@@ -1136,13 +1159,17 @@ def _apply_formatting(sheet_id: str, tab: str) -> None:
 def setup_tab(sheet_id: str, tab: str) -> None:
     created = sheets.ensure_tab(sheet_id, tab)
     _apply_formatting(sheet_id, tab)
+    _apply_summary_formatting(sheet_id)
     print(f"Tab '{tab}' {'created' if created else 'already existed'}; formatting applied.")
 
 
 def migrate_formatting(sheet_id: str, tab: str) -> None:
     """Bring an existing tab up to date with current formatting. Idempotent."""
     _apply_formatting(sheet_id, tab)
-    print(f"Formatting refreshed for tab '{tab}'.")
+    _apply_summary_formatting(sheet_id)
+    # summary used to live in V1:W12 on the ledger tab; clear any remnants
+    sheets.write_range(sheet_id, tab, "V1:W12", [["", ""]] * 12)
+    print(f"Formatting refreshed for tab '{tab}' (+ summary tab).")
 
 
 # ---------------------------------------------------------------------------
@@ -1262,7 +1289,7 @@ def main() -> None:
     sheets.replace_all_conditional_format_rules(sheet_id, tab, CONDITIONAL_RULES)
     sheets.set_basic_filter(sheet_id, tab, {1: HIDDEN_ROW_TYPES})
     summary = summarise(rows, computed, ty_start, ty_end)
-    sheets.write_range(sheet_id, tab, f"V1:W{len(summary)}", summary)
+    sheets.write_range(sheet_id, _summary_tab(), f"A1:B{len(summary)}", summary)
     print("Computed columns + summary written.")
     net = summary[5][1]
     print(f"Net gain/loss this tax year: £{net}")
