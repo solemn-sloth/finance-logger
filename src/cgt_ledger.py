@@ -37,6 +37,10 @@ once appended, the row is yours — later runs never edit or re-check it.
 The reverse case (ledger tracks more than you actually hold) is never
 auto-written — it may be an untaxable transfer to self-custody rather than
 a disposal — only a console warning is printed.
+
+REWARD and TRANSFER_IN/OUT rows are bookkeeping (pool cost, matching and
+dedupe correctness) — the tab's basic filter hides them from view; the
+tax-year reward income total is surfaced in the summary block instead.
 """
 
 import argparse
@@ -78,6 +82,10 @@ DISPOSAL_TYPES = {"SELL", "SWAP"}
 ACQUISITION_TYPES = {"BUY", "SWAP", "REWARD", "OPENING"}
 KNOWN_TYPES = DISPOSAL_TYPES | ACQUISITION_TYPES | {"TRANSFER_IN", "TRANSFER_OUT", "FEE"}
 
+# Kept in the data (pool cost, matching and dedupe correctness) but hidden
+# from view by the tab's basic filter — bookkeeping noise, not decisions.
+HIDDEN_ROW_TYPES = ["REWARD", "TRANSFER_IN", "TRANSFER_OUT"]
+
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
@@ -100,8 +108,17 @@ _DATE_FORMATS = [
 ]
 
 
-def parse_dt(value: str) -> datetime:
-    """Parse a ledger timestamp; naive values are taken as UTC."""
+_SHEETS_EPOCH = datetime(1899, 12, 30, tzinfo=UTC)
+
+
+def parse_dt(value) -> datetime:
+    """Parse a ledger timestamp; naive values are taken as UTC.
+
+    Numeric values are Google Sheets date serials (days since 1899-12-30),
+    which is how real Date cells come back from an unformatted read.
+    """
+    if isinstance(value, (int, float)):
+        return _SHEETS_EPOCH + timedelta(days=float(value))
     raw = str(value).strip()
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -931,7 +948,9 @@ def reconcile_holdings(
 # ---------------------------------------------------------------------------
 
 def read_ledger_rows(sheet_id: str, tab: str) -> list[Row]:
-    values = sheets.read_range(sheet_id, tab, "A2:N")
+    # Unformatted read: user display formats (e.g. 2dp on quantity columns)
+    # must never round the values the engine computes with.
+    values = sheets.read_range(sheet_id, tab, "A2:N", unformatted=True)
     rows = []
     for i, cells in enumerate(values):
         row = parse_row(i + 2, cells)
@@ -1003,6 +1022,13 @@ def summarise(rows: list[Row], computed: dict[int, Computed],
     net = gains + losses
     taxable = max(Decimal(0), net - ANNUAL_EXEMPT_AMOUNT)
     aea_left = max(Decimal(0), ANNUAL_EXEMPT_AMOUNT - max(net, Decimal(0)))
+    reward_income = sum(
+        ((r.income_taxed if r.income_taxed is not None else r.value_gbp) or Decimal(0)
+         for r in rows
+         if r.type == "REWARD" and r.dt
+         and ty_start <= r.dt.astimezone(LONDON).date() <= ty_end),
+        Decimal(0),
+    )
     return [
         ["Tax year", f"{ty_start.year}/{str(ty_end.year)[2:]} ({ty_start} to {ty_end})"],
         ["Disposals", len(disposals)],
@@ -1015,6 +1041,7 @@ def summarise(rows: list[Row], computed: dict[int, Computed],
         ["Taxable gain after AEA", _num(taxable)],
         ["Proceeds > £50k (report even if no tax due)",
          "YES" if proceeds > PROCEEDS_REPORTING_THRESHOLD else "NO"],
+        ["Reward income (GBP, taxed at receipt)", _num(reward_income)],
         ["Last updated (UTC)", iso(datetime.now(UTC))],
     ]
 
@@ -1094,7 +1121,12 @@ def _apply_formatting(sheet_id: str, tab: str) -> None:
     for col in range(14, 20):  # grey the computed columns O-T
         sheets.format_column_text_color(sheet_id, tab, col, 1, (0.45, 0.45, 0.45))
     sheets.format_column_number_format(sheet_id, tab, 0, 1, "dd/mm/yy")
+    for col in (3, 5, 15, 17):  # quantity columns: full precision, no fake 0.00
+        sheets.format_column_number_format(sheet_id, tab, col, 1, "0.########", "NUMBER")
+    for col in (6, 8, 12, 16, 18, 19):  # GBP columns
+        sheets.format_column_number_format(sheet_id, tab, col, 1, "£#,##0.00", "CURRENCY")
     sheets.replace_all_conditional_format_rules(sheet_id, tab, CONDITIONAL_RULES)
+    sheets.set_basic_filter(sheet_id, tab, {1: HIDDEN_ROW_TYPES})
     sheets.set_column_hidden(sheet_id, tab, 11)  # Txn ID: machine bookkeeping
     for cell, note in HEADER_NOTES.items():
         col = ord(cell[0]) - ord("A")
@@ -1228,8 +1260,9 @@ def main() -> None:
     write_dates(sheet_id, tab, rows)
     write_computed(sheet_id, tab, rows, computed)
     sheets.replace_all_conditional_format_rules(sheet_id, tab, CONDITIONAL_RULES)
+    sheets.set_basic_filter(sheet_id, tab, {1: HIDDEN_ROW_TYPES})
     summary = summarise(rows, computed, ty_start, ty_end)
-    sheets.write_range(sheet_id, tab, "V1:W11", summary)
+    sheets.write_range(sheet_id, tab, f"V1:W{len(summary)}", summary)
     print("Computed columns + summary written.")
     net = summary[5][1]
     print(f"Net gain/loss this tax year: £{net}")

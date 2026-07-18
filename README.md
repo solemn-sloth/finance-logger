@@ -144,6 +144,12 @@ un-logged disposal, gift, or transfer to self-custody), that's never
 auto-written to the sheet — only a console warning, since it's not always a
 taxable event and shouldn't be guessed at.
 
+Staking-reward and transfer rows are kept in the data — rewards carry pool
+units/cost basis and take part in 30-day matching; transfers anchor dedupe
+and reconciliation — but they're hidden from view by the tab's basic filter
+(re-applied each run, so unhiding lasts until the next sync). The tax year's
+total reward income appears in the summary block for self-assessment.
+
 ## Project structure
 
 ```

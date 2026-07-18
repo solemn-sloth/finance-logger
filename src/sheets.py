@@ -72,13 +72,21 @@ def append_row(sheet_id: str, tab: str, values: list) -> None:
     ).execute()
 
 
-def read_range(sheet_id: str, tab: str, a1: str) -> list[list]:
-    """Read a range; returns list of rows (formatted values). Trailing empties omitted by API."""
+def read_range(sheet_id: str, tab: str, a1: str, unformatted: bool = False) -> list[list]:
+    """Read a range; returns list of rows. Trailing empties omitted by API.
+
+    unformatted=True returns underlying values (numbers at full precision,
+    dates as serial numbers) — display formatting can't distort them.
+    """
     service = get_sheet_service()
     result = (
         service.spreadsheets()
         .values()
-        .get(spreadsheetId=sheet_id, range=f"'{tab}'!{a1}")
+        .get(
+            spreadsheetId=sheet_id,
+            range=f"'{tab}'!{a1}",
+            valueRenderOption="UNFORMATTED_VALUE" if unformatted else "FORMATTED_VALUE",
+        )
         .execute()
     )
     return result.get("values", [])
@@ -234,6 +242,26 @@ def replace_all_conditional_format_rules(sheet_id: str, tab: str, rules: list[di
         service.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id, body={"requests": requests}
         ).execute()
+
+
+def set_basic_filter(sheet_id: str, tab: str, hidden_by_col: dict[int, list[str]]) -> None:
+    """
+    Set the tab's basic filter, hiding the given values per column (0-indexed).
+    Replaces any existing basic filter; open-ended range so it covers rows
+    appended later.
+    """
+    service = get_sheet_service()
+    gid = _get_sheet_gid(sheet_id, tab)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"setBasicFilter": {"filter": {
+            "range": {"sheetId": gid, "startRowIndex": 0},
+            "filterSpecs": [
+                {"columnIndex": col, "filterCriteria": {"hiddenValues": values}}
+                for col, values in hidden_by_col.items()
+            ],
+        }}}]},
+    ).execute()
 
 
 def set_column_hidden(sheet_id: str, tab: str, col: int, hidden: bool = True) -> None:
