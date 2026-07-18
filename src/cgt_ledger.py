@@ -517,7 +517,9 @@ def _kraken_reward_to_row(l: dict) -> Row:
 
     asset = kraken.normalize_asset(l["asset"])
     dt = datetime.fromtimestamp(float(l["time"]), tz=UTC)
-    amount = _dec(l["amount"])
+    # Ledger semantics: balance change = amount - fee, so the units actually
+    # credited are net of the staking fee.
+    amount = _dec(l["amount"]) - _dec(l.get("fee"), Decimal(0))
     gbp, fx = kraken.get_gbp_value(asset, amount, dt.date())
     return Row(
         idx=0, dt=dt, type="REWARD",
@@ -529,13 +531,132 @@ def _kraken_reward_to_row(l: dict) -> Row:
     )
 
 
+def _kraken_ledger_rows(entries: list[dict], only_asset: str | None = None) -> list[Row]:
+    """
+    Rows for the ledger-only Kraken activity that TradesHistory can't see:
+    instant conversions ("spend"/"receive" pairs, grouped by refid) and
+    crypto deposits/withdrawals. Rewards and internal Earn allocations are
+    handled elsewhere/skipped. only_asset limits output (and the OHLC
+    valuation calls conversion triggers) to groups touching that asset.
+    """
+    import kraken
+
+    rows: list[Row] = []
+    conversions: dict[str, list[dict]] = {}
+    for e in entries:
+        etype = e.get("type")
+        if etype in ("spend", "receive"):
+            conversions.setdefault(e["refid"], []).append(e)
+        elif etype in ("deposit", "withdrawal"):
+            asset = kraken.normalize_asset(e["asset"])
+            if asset in kraken.FIAT or (only_asset and asset != only_asset):
+                continue
+            dt = datetime.fromtimestamp(float(e["time"]), tz=UTC)
+            net = _dec(e["amount"]) - _dec(e.get("fee"), Decimal(0))
+            if etype == "deposit":
+                rows.append(Row(
+                    idx=0, dt=dt, type="TRANSFER_IN",
+                    asset_out="", qty_out=None, asset_in=asset, qty_in=net,
+                    value_gbp=None, method="", fee_gbp=None, fee_orig="",
+                    wallet="Kraken", txid=f"KRAKEN:{e['refid']}", income_taxed=None,
+                    notes=("external deposit — not a disposal/acquisition; its S104 "
+                           "pool cost comes from the original purchase (e.g. Coinbase). "
+                           "Add an OPENING/BUY row for it if not already covered."),
+                ))
+            else:
+                rows.append(Row(
+                    idx=0, dt=dt, type="TRANSFER_OUT",
+                    asset_out=asset, qty_out=-net, asset_in="", qty_in=None,
+                    value_gbp=None, method="", fee_gbp=None, fee_orig="",
+                    wallet="Kraken", txid=f"KRAKEN:{e['refid']}", income_taxed=None,
+                    notes="withdrawal to external wallet — not a disposal; pool unchanged",
+                ))
+
+    for refid, pair in conversions.items():
+        spend = next((e for e in pair if float(e["amount"]) < 0), None)
+        receive = next((e for e in pair if float(e["amount"]) > 0), None)
+        if spend is None or receive is None:
+            print(f"WARN: unpaired Kraken conversion {refid}, skipped", file=sys.stderr)
+            continue
+        s_asset = kraken.normalize_asset(spend["asset"])
+        r_asset = kraken.normalize_asset(receive["asset"])
+        s_fiat, r_fiat = s_asset in kraken.FIAT, r_asset in kraken.FIAT
+        if s_fiat and r_fiat:
+            continue
+        if only_asset and only_asset not in (s_asset, r_asset):
+            continue
+        dt = datetime.fromtimestamp(float(spend["time"]), tz=UTC)
+        s_qty = -(_dec(spend["amount"]) - _dec(spend.get("fee"), Decimal(0)))  # units out, incl fee
+        r_qty = _dec(receive["amount"]) - _dec(receive.get("fee"), Decimal(0))
+        s_fee = _dec(spend.get("fee"), Decimal(0))
+
+        if s_fiat:  # fiat -> crypto = BUY
+            gross = abs(_dec(spend["amount"]))
+            if s_asset == "GBP":
+                value, method, fee_gbp, fee_orig = gross, "Kraken convert (GBP)", s_fee, ""
+            else:
+                value, fx = kraken.get_gbp_value(s_asset, gross, dt.date())
+                fee_gbp = kraken.get_gbp_value(s_asset, s_fee, dt.date())[0] if s_fee else Decimal(0)
+                method = f"Kraken convert {gross.normalize():f} {s_asset}; {fx}"
+                fee_orig = f"{s_fee.normalize():f} {s_asset}" if s_fee else ""
+            rows.append(Row(
+                idx=0, dt=dt, type="BUY",
+                asset_out="", qty_out=None, asset_in=r_asset, qty_in=r_qty,
+                value_gbp=value, method=method,
+                fee_gbp=fee_gbp if fee_gbp else None, fee_orig=fee_orig,
+                wallet="Kraken", txid=f"KRAKEN:{refid}", income_taxed=None,
+                notes=f"instant convert {s_asset}->{r_asset}",
+            ))
+        elif r_fiat:  # crypto -> fiat = SELL; gross proceeds = amount before fee
+            gross = _dec(receive["amount"])
+            r_fee = _dec(receive.get("fee"), Decimal(0))
+            if r_asset == "GBP":
+                value, method, fee_gbp, fee_orig = gross, "Kraken convert (GBP)", r_fee, ""
+            else:
+                value, fx = kraken.get_gbp_value(r_asset, gross, dt.date())
+                fee_gbp = kraken.get_gbp_value(r_asset, r_fee, dt.date())[0] if r_fee else Decimal(0)
+                method = f"Kraken convert {gross.normalize():f} {r_asset}; {fx}"
+                fee_orig = f"{r_fee.normalize():f} {r_asset}" if r_fee else ""
+            rows.append(Row(
+                idx=0, dt=dt, type="SELL",
+                asset_out=s_asset, qty_out=s_qty, asset_in="", qty_in=None,
+                value_gbp=value, method=method,
+                fee_gbp=fee_gbp if fee_gbp else None, fee_orig=fee_orig,
+                wallet="Kraken", txid=f"KRAKEN:{refid}", income_taxed=None,
+                notes=f"instant convert {s_asset}->{r_asset}",
+            ))
+        else:  # crypto -> crypto = SWAP; value the disposed side, else the received
+            value, method = None, ""
+            try:
+                value, fx = kraken.get_gbp_value(s_asset, s_qty, dt.date())
+                method = f"Kraken convert; disposed side: {fx}"
+            except Exception:
+                try:
+                    value, fx = kraken.get_gbp_value(r_asset, r_qty, dt.date())
+                    method = f"Kraken convert; received side: {fx}"
+                except Exception:
+                    print(f"WARN: no GBP route for {s_asset}->{r_asset} conversion "
+                          f"{refid}; Value left blank for manual input", file=sys.stderr)
+            rows.append(Row(
+                idx=0, dt=dt, type="SWAP",
+                asset_out=s_asset, qty_out=s_qty, asset_in=r_asset, qty_in=r_qty,
+                value_gbp=value, method=method,
+                fee_gbp=None, fee_orig="",
+                wallet="Kraken", txid=f"KRAKEN:{refid}", income_taxed=None,
+                notes=f"instant convert {s_asset}->{r_asset}",
+            ))
+    return rows
+
+
 def fetch_kraken_rows(since: datetime) -> list[Row]:
     import kraken
 
     since_ts = int(since.timestamp())
+    entries = kraken.get_ledger_entries(since_ts)
     return (
         [_kraken_trade_to_row(t) for t in kraken.get_trades_history(since_ts)]
-        + [_kraken_reward_to_row(l) for l in kraken.get_staking_rewards(since_ts)]
+        + _kraken_ledger_rows(entries)
+        + [_kraken_reward_to_row(l) for l in kraken.filter_reward_entries(entries)]
     )
 
 
@@ -569,17 +690,22 @@ def fetch_current_holdings() -> dict[str, tuple[Decimal, str]]:
     return holdings
 
 
+BACKFILL_MARKER = "backfill v2"
+
+
 def backfill_opening(
     asset: str, wallet: str, missing_qty: Decimal, ty_start: date,
-) -> tuple[Row | None, str]:
+    allow_excess: bool = False,
+) -> tuple[list[Row], str]:
     """
     Try to reconstruct the opening Section 104 pool for `asset` from full
-    pre-tax-year API history (T212 order fills / Kraken trades + rewards),
-    reusing the CGT engine for the pool maths.
+    pre-tax-year API history (T212 order fills / Kraken trades, conversions
+    and rewards), reusing the CGT engine for the pool maths.
 
-    Returns (completed OPENING Row, "") if the reconstructed units match
-    missing_qty, else (None, summary of what was found) so the caller can
-    enrich the manual stub. Backfill failures never guess at a value.
+    Returns (rows, note): a completed OPENING row when the reconstructed units
+    match missing_qty; plus a manual stub for any portion explained only by
+    external deposits (unknown cost basis). Empty rows + a summary note when
+    reconstruction can't account for the gap. Never guesses at a value.
     """
     window = datetime(ty_start.year, ty_start.month, ty_start.day, tzinfo=UTC)
     try:
@@ -593,47 +719,96 @@ def backfill_opening(
         else:
             import kraken
 
-            # Filter raw entries by asset + time BEFORE converting: conversion
-            # triggers per-day OHLC valuation calls we don't want to waste.
             window_ts = window.timestamp()
             trades = [t for t in kraken.get_trades_history(0)
                       if float(t["time"]) < window_ts
                       and asset in kraken.pair_assets(t["pair"])]
-            rewards = [l for l in kraken.get_staking_rewards(0)
-                       if float(l["time"]) < window_ts
-                       and kraken.normalize_asset(l["asset"]) == asset]
+            entries = [l for l in kraken.get_ledger_entries(0)
+                       if float(l["time"]) < window_ts]
             hist = [_kraken_trade_to_row(t) for t in trades]
-            hist += [_kraken_reward_to_row(l) for l in rewards]
-            source = "Kraken trade/reward history"
+            hist += _kraken_ledger_rows(entries, only_asset=asset)
+            hist += [_kraken_reward_to_row(l) for l in kraken.filter_reward_entries(entries)
+                     if kraken.normalize_asset(l["asset"]) == asset]
+            source = "Kraken trade/conversion/reward history"
     except Exception as exc:
         print(f"WARN: {wallet} backfill fetch for {asset} failed: {exc}", file=sys.stderr)
-        return None, f"backfill attempted: {wallet} history fetch failed ({exc})"
+        return [], f"{BACKFILL_MARKER}: {wallet} history fetch failed ({exc})"
 
     if not hist:
-        return None, f"backfill attempted: no pre-{ty_start} {asset} transactions found in {source}"
+        return [], f"{BACKFILL_MARKER}: no pre-{ty_start} {asset} transactions found in {source}"
 
     for i, r in enumerate(hist):
         r.idx = i
     _, pools = compute_cgt(hist)
     units, cost = pools.get(asset, (Decimal(0), Decimal(0)))
+    deposits = [r for r in hist if r.type == "TRANSFER_IN"]
+    deposited = sum((r.qty_in for r in deposits), Decimal(0))
+    withdrawn = sum((r.qty_out for r in hist if r.type == "TRANSFER_OUT"), Decimal(0))
 
-    if abs(units - missing_qty) <= RECONCILE_TOLERANCE:
-        prefix = "T212" if wallet == "T212-Invest" else "KRAKEN"
-        return Row(
-            idx=0,
-            dt=window - timedelta(days=1), type="OPENING",
-            asset_out="", qty_out=None, asset_in=asset, qty_in=units,
-            value_gbp=cost, method=f"{source} backfill (fills before {ty_start})",
+    prefix = "T212" if wallet == "T212-Invest" else "KRAKEN"
+    opening = Row(
+        idx=0, dt=window - timedelta(days=1), type="OPENING",
+        asset_out="", qty_out=None, asset_in=asset, qty_in=units,
+        value_gbp=cost, method=f"{source} backfill (transactions before {ty_start})",
+        fee_gbp=None, fee_orig="", wallet=wallet,
+        txid=f"{prefix}:OPENING-{asset}", income_taxed=None,
+        notes=(f"Opening pool auto-computed from {len(hist)} pre-{ty_start} "
+               f"transaction(s) in {source}."),
+    ) if units > 0 else None
+
+    # 0.5% slack: earlier-imported reward rows carry gross (pre-fee) units and
+    # Earn allocation fees nibble at balances — unit-perfect matches are rare.
+    match_tol = max(RECONCILE_TOLERANCE, abs(missing_qty) * Decimal("0.005"))
+
+    # allow_excess (disposal-triggered reconstruction): the reconstructed pool
+    # may legitimately exceed the gap — e.g. part of the holding was withdrawn
+    # to self-custody, which keeps it in the S104 pool but off the exchange
+    # balance. Accept as long as it covers the gap.
+    if allow_excess and units + deposited >= missing_qty - match_tol:
+        result = [opening] if opening else []
+        if deposited > 0:
+            dep_detail = "; ".join(
+                f"{r.qty_in.normalize():f} on {date_str(r.dt)}" for r in deposits
+            )
+            result.append(Row(
+                idx=0, dt=window - timedelta(days=1), type="OPENING",
+                asset_out="", qty_out=None, asset_in=asset, qty_in=deposited,
+                value_gbp=None, method="",
+                fee_gbp=None, fee_orig="", wallet=wallet,
+                txid=f"MANUAL:NEEDS-INPUT-{asset}", income_taxed=None,
+                notes=(f"Matches external deposit(s) of {asset}: {dep_detail}. Fill in "
+                       f"Value (GBP) with what you originally paid. [{BACKFILL_MARKER}]"),
+            ))
+        return result, ""
+
+    if abs(units - missing_qty) <= match_tol:
+        return [opening] if opening else [], ""
+
+    if abs(units + deposited - missing_qty) <= match_tol and deposited > 0:
+        dep_detail = "; ".join(
+            f"{r.qty_in.normalize():f} on {date_str(r.dt)}" for r in deposits
+        )
+        stub = Row(
+            idx=0, dt=window - timedelta(days=1), type="OPENING",
+            asset_out="", qty_out=None, asset_in=asset, qty_in=deposited,
+            value_gbp=None, method="",
             fee_gbp=None, fee_orig="", wallet=wallet,
-            txid=f"{prefix}:OPENING-{asset}", income_taxed=None,
-            notes=(f"Opening pool auto-computed from {len(hist)} pre-{ty_start} "
-                   f"transaction(s) in {source}."),
-        ), ""
-    return None, (
-        f"backfill attempted: {source} only reconstructs "
-        f"{units.normalize():f} {asset} (cost £{cost:.2f}) of the "
-        f"{missing_qty.normalize():f} missing — remainder likely deposited/"
-        f"transferred in from elsewhere; enter the combined cost basis manually."
+            txid=f"MANUAL:NEEDS-INPUT-{asset}", income_taxed=None,
+            notes=(f"Matches external deposit(s) of {asset}: {dep_detail}. These came "
+                   f"from outside {wallet} (e.g. Coinbase) so their cost basis isn't "
+                   f"knowable here — fill in Value (GBP) with what you originally paid, "
+                   f"and correct the date to the original acquisition. "
+                   f"[{BACKFILL_MARKER}]"),
+        )
+        return ([opening, stub] if opening else [stub]), ""
+
+    return [], (
+        f"{BACKFILL_MARKER}: {source} reconstructs {units.normalize():f} {asset} "
+        f"(cost £{cost:.2f})"
+        + (f" + {deposited.normalize():f} deposited externally" if deposited else "")
+        + (f" − {withdrawn.normalize():f} withdrawn" if withdrawn else "")
+        + f", which doesn't add up to the {missing_qty.normalize():f} gap — "
+        f"review Notes on this asset's rows and enter the opening cost manually."
     )
 
 
@@ -655,7 +830,28 @@ def reconcile_holdings(
     """
     stub_dt = datetime(ty_start.year, ty_start.month, ty_start.day, tzinfo=UTC) - timedelta(days=1)
     to_append, to_replace = [], []
-    for asset, (actual_qty, wallet) in sorted(holdings.items()):
+
+    # Per-asset ledger flows. The true opening gap is against net
+    # acquisition/disposal flow, not the floored pool: a disposal exceeding
+    # the pool clamps at zero (SHORTFALL) and would understate how much
+    # opening history is really missing.
+    flows: dict[str, Decimal] = {}
+    transfers_in: dict[str, list[Row]] = {}
+    row_wallets: dict[str, str] = {}
+    for r in rows:
+        if r.dt is None or r.warning:
+            continue
+        if r.type in ("BUY", "REWARD", "OPENING", "SWAP") and r.asset_in:
+            flows[r.asset_in] = flows.get(r.asset_in, Decimal(0)) + (r.qty_in or Decimal(0))
+        if r.type in ("SELL", "SWAP") and r.asset_out:
+            flows[r.asset_out] = flows.get(r.asset_out, Decimal(0)) - (r.qty_out or Decimal(0))
+            row_wallets.setdefault(r.asset_out, r.wallet)
+        if r.type == "TRANSFER_IN" and r.asset_in:
+            transfers_in.setdefault(r.asset_in, []).append(r)
+
+    # Candidates: (needed units, wallet, actual balance or None, allow_excess)
+    candidates: dict[str, tuple[Decimal, str, Decimal | None, bool]] = {}
+    for asset, (actual_qty, wallet) in holdings.items():
         tracked_qty = asset_pools.get(asset, (Decimal(0), Decimal(0)))[0]
         diff = actual_qty - tracked_qty
         if diff < -RECONCILE_TOLERANCE:
@@ -666,38 +862,65 @@ def reconcile_holdings(
                 f"to self-custody, no ledger action needed; if sold/spent/gifted, add a "
                 f"manual SELL row.", file=sys.stderr,
             )
+        elif diff > RECONCILE_TOLERANCE:
+            needed = actual_qty - flows.get(asset, Decimal(0))
+            candidates[asset] = (needed, wallet, actual_qty, False)
+    # Assets disposed beyond their tracked acquisitions but no longer held
+    # (e.g. fully swapped away): still need an opening pool for correct gains.
+    for asset, flow in flows.items():
+        if asset in candidates or asset in holdings:
             continue
-        if diff <= RECONCILE_TOLERANCE:
-            continue
+        if flow < -RECONCILE_TOLERANCE:
+            candidates[asset] = (-flow, row_wallets.get(asset, "Kraken"), None, True)
 
+    for asset, (needed, wallet, actual_qty, allow_excess) in sorted(candidates.items()):
         stub_txid = f"MANUAL:NEEDS-INPUT-{asset}"
         existing = next((r for r in rows if r.txid == stub_txid), None)
         if existing is not None:
             if existing.value_gbp is not None:  # user filled it in — theirs now
                 continue
-            if "backfill attempted" in existing.notes:  # already tried, don't re-fetch daily
+            if BACKFILL_MARKER in existing.notes:  # this version already tried
                 continue
 
-        resolved, attempt_note = backfill_opening(asset, wallet, diff, ty_start)
-        if resolved is not None:
+        resolved, attempt_note = backfill_opening(asset, wallet, needed, ty_start,
+                                                  allow_excess=allow_excess)
+        if resolved:
             if existing is not None:
-                resolved.idx = existing.idx
-                to_replace.append(resolved)
+                resolved[0].idx = existing.idx
+                to_replace.append(resolved[0])
+                to_append.extend(resolved[1:])
             else:
-                to_append.append(resolved)
+                to_append.extend(resolved)
             continue
 
+        transfer_hint = ""
+        asset_transfers = transfers_in.get(asset, [])
+        in_window_transfers = sum((r.qty_in for r in asset_transfers), Decimal(0))
+        # 1% slack: tiny Earn-allocation fees can nibble at deposited amounts
+        hint_tol = max(RECONCILE_TOLERANCE, in_window_transfers * Decimal("0.01"))
+        if in_window_transfers and abs(needed - in_window_transfers) <= hint_tol:
+            detail = "; ".join(
+                f"{r.qty_in.normalize():f} on {date_str(r.dt)}" for r in asset_transfers
+            )
+            transfer_hint = (
+                f" This gap matches your external deposit(s): {detail} — enter what you "
+                f"originally paid for those coins (e.g. on Coinbase), and correct the "
+                f"date to the original acquisition."
+            )
+
+        shown_balance = (f"{wallet} shows {actual_qty.normalize():f} {asset}"
+                         if actual_qty is not None
+                         else f"{asset} disposals exceed tracked acquisitions")
         stub = Row(
             idx=existing.idx if existing else 0, dt=stub_dt, type="OPENING",
-            asset_out="", qty_out=None, asset_in=asset, qty_in=diff,
+            asset_out="", qty_out=None, asset_in=asset, qty_in=needed,
             value_gbp=None, method="",
             fee_gbp=None, fee_orig="", wallet=wallet, txid=stub_txid,
             income_taxed=None,
-            notes=(f"Auto-flagged: {wallet} shows {actual_qty.normalize():f} {asset} but "
-                   f"the ledger only accounts for {tracked_qty.normalize():f}. Fill in "
-                   f"Value (GBP) with the cost basis for the missing {diff.normalize():f} "
-                   f"units, and correct the date above if this wasn't all acquired before "
-                   f"the tax year start. [{attempt_note}]"),
+            notes=(f"Auto-flagged: {shown_balance} but ledger transactions only account "
+                   f"for {flows.get(asset, Decimal(0)).normalize():f}. Fill in Value "
+                   f"(GBP) with the cost basis for the missing {needed.normalize():f} "
+                   f"units.{transfer_hint} [{attempt_note}]"),
         )
         (to_replace if existing is not None else to_append).append(stub)
     return to_append, to_replace

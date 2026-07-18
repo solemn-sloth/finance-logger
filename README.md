@@ -117,6 +117,15 @@ Kraken API key needs "Query Funds", "Query Closed Orders & Trades" and
 "Query Ledger Entries" permissions (all read-only) for the CGT ledger to pull
 trades, staking rewards, and current balances.
 
+Kraken ingestion is ledger-based: order-book trades come from TradesHistory,
+but instant conversions (the Convert button — spend/receive ledger pairs),
+crypto deposits and withdrawals only exist in the Ledgers endpoint, so both
+are read. Crypto-to-crypto conversions are recorded as SWAP disposals valued
+at the daily GBP close; deposits/withdrawals become TRANSFER rows (not
+disposals — the Section 104 pool spans wallets, so moving coins doesn't
+change cost basis, but externally deposited coins need an OPENING row for
+the basis they arrived with).
+
 ### Running
 
 ```bash

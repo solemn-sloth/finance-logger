@@ -226,13 +226,22 @@ def get_trades_history(since_ts: int) -> list[dict]:
     return _paginated_private("TradesHistory", "trades", since_ts)
 
 
-def get_staking_rewards(since_ts: int) -> list[dict]:
+def get_ledger_entries(since_ts: int) -> list[dict]:
     """
-    Staking/Earn reward ledger entries since unix ts (positive amounts only).
+    Full ledger history since unix ts, all entry types. This is the only place
+    instant conversions ("spend"/"receive" pairs), deposits and withdrawals
+    appear — TradesHistory covers order-book trades only.
+    """
+    return _paginated_private("Ledgers", "ledger", since_ts)
+
+
+def filter_reward_entries(entries: list[dict]) -> list[dict]:
+    """
+    Staking/Earn reward entries from a ledger-entry list (positive amounts only).
     Excludes allocation/deallocation transfers between spot and Earn wallets.
     """
     rewards = []
-    for entry in _paginated_private("Ledgers", "ledger", since_ts):
+    for entry in entries:
         etype = entry.get("type", "")
         subtype = entry.get("subtype", "") or ""
         amount = float(entry.get("amount", 0))
@@ -243,3 +252,8 @@ def get_staking_rewards(since_ts: int) -> list[dict]:
         elif etype == "earn" and subtype == "reward":
             rewards.append(entry)
     return rewards
+
+
+def get_staking_rewards(since_ts: int) -> list[dict]:
+    """Staking/Earn reward ledger entries since unix ts."""
+    return filter_reward_entries(get_ledger_entries(since_ts))
