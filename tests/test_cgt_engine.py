@@ -276,15 +276,34 @@ def test_build_summary_block_layout():
     assert block[1] == ["Tax year", "2026/27"]
     assert block[2] == ["Disposals", 1]
     assert isinstance(block[3][1], float) and block[3][1] == 3000.0   # proceeds
-    assert block[12][1] == "NO"                                       # >50k flag
+    assert block[13][1] == "NO"                                       # >50k flag
     labels = [r[0] for r in block[1:]]
     assert labels == [
         "Tax year", "Disposals", "Total proceeds", "Total gains", "Total losses",
         "Net gain/loss", "Losses b/f available", "Losses b/f used",
         "Annual exempt amount", "Taxable gain (after losses + AEA)",
+        "Estimated CGT due (basic rate, est.)",
         "Losses carried forward", "Proceeds > £50k (report even if no tax due)",
         "Reward income (taxed at receipt)",
     ], labels
+
+
+def test_estimated_cgt_due_rates_and_band():
+    # Taxable gain of 2000 (net 5000 - 3000 AEA) in 2026/27: 18% basic, 24% higher.
+    rows = [
+        row("2026-04-06T00:00", "OPENING", in_a="ABC", in_q="10", value="1000"),
+        row("2026-06-01T10:00", "SELL", out_a="ABC", out_q="10", value="6000"),
+    ]
+    c, _ = compute_cgt(rows)
+    basic = summarise_years(rows, c)[-1]
+    higher = summarise_years(rows, c, higher_rate=True)[-1]
+    assert basic.taxable == Decimal("2000"), basic.taxable
+    assert basic.tax_due == Decimal("360.00"), basic.tax_due    # 2000 * 18%
+    assert higher.tax_due == Decimal("480.00"), higher.tax_due  # 2000 * 24%
+    # a loss-making year owes nothing
+    assert cgt_ledger.aea_for(2023) == Decimal("6000")          # AEA was reduced
+    assert cgt_ledger.cgt_rate_for(2023, False) == Decimal("0.10")  # pre-30-Oct-2024
+    assert cgt_ledger.cgt_rate_for(2024, False) == Decimal("0.18")
 
 
 def test_gap_detector_flags_shortfall():

@@ -983,7 +983,7 @@ def reconcile_holdings(
 # ---------------------------------------------------------------------------
 
 SUMMARY_MARKER = "CGT SUMMARY"
-SUMMARY_BLOCK_HEIGHT = 14
+SUMMARY_BLOCK_HEIGHT = 15
 
 
 def read_ledger(sheet_id: str, tab: str) -> tuple[list[Row], int | None]:
@@ -1092,6 +1092,21 @@ def aea_for(year: int) -> Decimal:
     return Decimal("12300")
 
 
+def cgt_rate_for(year: int, higher_rate: bool) -> Decimal:
+    """Estimated UK CGT rate on crypto (a non-property 'other' chargeable asset)
+    for the tax year starting 6 April `year`, as a fraction.
+
+    Rates rose on 30 Oct 2024 from 10%/20% to 18%/24%. 2024/25 straddles that
+    date; disposals from 30 Oct 2024 (all the current ledger's 2024/25 ones) use
+    the new rate, so we apply 18%/24% to 2024/25 as a whole — an ESTIMATE that
+    also ignores the income-band straddle (a gain spanning the basic-rate
+    threshold is part-taxed at each rate). Pick the band via CGT_TAXPAYER_BAND.
+    """
+    if year >= 2024:
+        return Decimal("0.24") if higher_rate else Decimal("0.18")
+    return Decimal("0.20") if higher_rate else Decimal("0.10")
+
+
 @dataclass
 class YearSummary:
     year: int                 # tax year starting 6 April `year`
@@ -1104,13 +1119,15 @@ class YearSummary:
     losses_bf_used: Decimal
     aea: Decimal
     taxable: Decimal
+    tax_due: Decimal          # estimated CGT on the taxable gain (see cgt_rate_for)
     losses_cf: Decimal        # carried into the next year
     reward_income: Decimal
 
 
 def summarise_years(rows: list[Row], computed: dict[int, Computed],
                     losses_bf: Decimal = Decimal(0),
-                    today: date | None = None) -> list[YearSummary]:
+                    today: date | None = None,
+                    higher_rate: bool = False) -> list[YearSummary]:
     """
     Per-tax-year totals with the UK loss carry-forward chain: current-year
     losses offset current-year gains first (mandatory); brought-forward losses
@@ -1155,14 +1172,16 @@ def summarise_years(rows: list[Row], computed: dict[int, Computed],
              for r in rows if r.type == "REWARD" and r.dt and ty(r) == year),
             Decimal(0),
         )
+        tax_due = (taxable * cgt_rate_for(year, higher_rate)).quantize(Decimal("0.01"))
         out.append(YearSummary(year, len(disposals), proceeds, gains, losses, net,
-                               pool, bf_used, aea, taxable, cf, reward_income))
+                               pool, bf_used, aea, taxable, tax_due, cf, reward_income))
         pool = cf
     return out
 
 
-def build_summary_block(years: list[YearSummary], now: datetime) -> list[list]:
-    """The 14-row summary block (marker row included): labels in column A,
+def build_summary_block(years: list[YearSummary], now: datetime,
+                        band_label: str = "basic rate") -> list[list]:
+    """The 15-row summary block (marker row included): labels in column A,
     one column per tax year. Numeric cells are numbers, never strings."""
     def per(fn):
         return [fn(y) for y in years]
@@ -1178,6 +1197,7 @@ def build_summary_block(years: list[YearSummary], now: datetime) -> list[list]:
         ["Losses b/f used"] + per(lambda y: _num(y.losses_bf_used)),
         ["Annual exempt amount"] + per(lambda y: _num(y.aea)),
         ["Taxable gain (after losses + AEA)"] + per(lambda y: _num(y.taxable)),
+        [f"Estimated CGT due ({band_label}, est.)"] + per(lambda y: _num(y.tax_due)),
         ["Losses carried forward"] + per(lambda y: _num(y.losses_cf)),
         ["Proceeds > £50k (report even if no tax due)"]
         + per(lambda y: "YES" if y.proceeds > PROCEEDS_REPORTING_THRESHOLD else "NO"),
@@ -1269,11 +1289,12 @@ _CURRENCY_FMT = {"numberFormat": {"type": "CURRENCY", "pattern": "£#,##0.00"}}
 
 
 def write_summary(sheet_id: str, tab: str, marker_row: int,
-                  years: list[YearSummary], now: datetime | None = None) -> None:
+                  years: list[YearSummary], now: datetime | None = None,
+                  band_label: str = "basic rate") -> None:
     """Write the summary block at A{marker_row} and style it (banner fill,
     bold labels/year headers, £ formats). Block-bounded and idempotent —
     overrides any data-column formats bleeding into these rows."""
-    block = build_summary_block(years, now or datetime.now(UTC))
+    block = build_summary_block(years, now or datetime.now(UTC), band_label)
     sheets.write_range(sheet_id, tab, f"A{marker_row}", block)
     m0 = marker_row - 1  # 0-based
     ncols = 1 + len(years)
@@ -1298,12 +1319,12 @@ def write_summary(sheet_id: str, tab: str, marker_row: int,
           "startColumnIndex": 1, "endColumnIndex": ncols},
          {"numberFormat": {"type": "NUMBER", "pattern": "0"}},
          "userEnteredFormat.numberFormat"),
-        # currency: Total proceeds .. Losses carried forward
-        ({"startRowIndex": m0 + 3, "endRowIndex": m0 + 12,
+        # currency: Total proceeds .. Losses carried forward (incl. est. CGT due)
+        ({"startRowIndex": m0 + 3, "endRowIndex": m0 + 13,
           "startColumnIndex": 1, "endColumnIndex": ncols},
          _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
         # currency: Reward income
-        ({"startRowIndex": m0 + 13, "endRowIndex": m0 + SUMMARY_BLOCK_HEIGHT,
+        ({"startRowIndex": m0 + 14, "endRowIndex": m0 + SUMMARY_BLOCK_HEIGHT,
           "startColumnIndex": 1, "endColumnIndex": ncols},
          _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
     ])
@@ -1368,8 +1389,8 @@ def setup_tab(sheet_id: str, tab: str, losses_bf: Decimal) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def _print_summary(years: list[YearSummary]) -> None:
-    block = build_summary_block(years, datetime.now(UTC))
+def _print_summary(years: list[YearSummary], band_label: str = "basic rate") -> None:
+    block = build_summary_block(years, datetime.now(UTC), band_label)
     for line in block[1:]:
         print("  " + str(line[0]).ljust(44)
               + "  ".join(f"{v!s:>12}" for v in line[1:]))
@@ -1417,6 +1438,9 @@ def main() -> None:
     ty_start = date.fromisoformat(os.getenv("CGT_TAX_YEAR_START", "2026-04-06"))
     since = datetime(ty_start.year, ty_start.month, ty_start.day, tzinfo=UTC)
     losses_bf = _dec(os.getenv("CGT_LOSSES_BF"), Decimal(0))
+    # Estimated-CGT-due row: which rate band to price the taxable gain at.
+    higher_rate = os.getenv("CGT_TAXPAYER_BAND", "basic").strip().lower() == "higher"
+    band_label = "higher rate" if higher_rate else "basic rate"
 
     if args.setup:
         setup_tab(sheet_id, tab, losses_bf)
@@ -1463,7 +1487,8 @@ def main() -> None:
     if args.dry_run:
         computed, _ = compute_cgt(rows)
         print("Summary (existing rows only):")
-        _print_summary(summarise_years(rows, computed, losses_bf=losses_bf))
+        _print_summary(summarise_years(rows, computed, losses_bf=losses_bf,
+                                       higher_rate=higher_rate), band_label)
         for verb, batch in (("append", new_rows + to_append),
                             ("update in place", to_replace)):
             if batch:
@@ -1521,9 +1546,10 @@ def main() -> None:
     region_end = (marker - 1) if marker is not None else (len(rows) + 1)
     write_sorted_data(sheet_id, tab, rows, computed, region_end)
 
-    years = summarise_years(rows, computed, losses_bf=losses_bf)
+    years = summarise_years(rows, computed, losses_bf=losses_bf,
+                            higher_rate=higher_rate)
     marker_row = marker if marker is not None else len(rows) + 3
-    write_summary(sheet_id, tab, marker_row, years)
+    write_summary(sheet_id, tab, marker_row, years, band_label=band_label)
     apply_dynamic_bounds(sheet_id, tab, len(rows))
     latest = years[-1]
     print(f"Computed columns + summary written. {tax_year_label(latest.year)}: "

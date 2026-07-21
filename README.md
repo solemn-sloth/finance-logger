@@ -192,6 +192,21 @@ and reconciliation — but they're hidden from view by the tab's basic filter
 never hidden; unhiding lasts until the next sync). Each tax year's total
 reward income appears in the summary block for self-assessment.
 
+### Estimated CGT due
+
+The summary block prices each year's taxable gain into an **Estimated CGT due**
+row, so the tax owed doesn't have to be worked out by hand. Crypto is an
+"other" chargeable asset: **18% basic / 24% higher** from 30 Oct 2024, and
+10% / 20% before it. Set the band with `CGT_TAXPAYER_BAND=basic|higher`
+(default `basic`); the row label states which band it used.
+
+It is an **estimate** — it applies one band to the whole year, so it ignores a
+gain that straddles the basic-rate threshold (part-taxed at each rate), and it
+prices all of 2024/25 at the post-30-Oct rate. The annual exempt amount is
+applied per year from its own historical value (`aea_for`): £12,300 through
+2022/23, £6,000 for 2023/24, £3,000 from 2024/25 — the allowance was cut twice
+over that span, so older years are more forgiving than the current one.
+
 ## Project structure
 
 ```
