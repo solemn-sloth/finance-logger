@@ -2,8 +2,10 @@
 """
 UK Capital Gains Tax ledger — maintains the 'CGT Ledger' sheet tab.
 
-Sources: Trading 212 Invest (GIA) order history + Kraken trades/rewards,
-plus manually entered rows (RSUs, anything without an API). The sheet is
+Sources: Trading 212 Invest (GIA) order history + Kraken trades/rewards
++ Coinbase (retail v2 transactions + Advanced Trade fills, from the tax-year
+start onward), plus manually entered rows (RSUs, anything without an API).
+The sheet is
 the source of truth for input columns A-N; this script appends new API
 transactions (deduped on Txn ID, column L) and recomputes the derived
 columns O-T for every row using UK share-matching rules: same-day,
@@ -37,7 +39,7 @@ Manual row conventions:
     Income Taxed = amount already taxed through payroll (becomes cost basis).
   - Any manual Txn ID must be unique, prefix MANUAL: recommended.
 
-Reconciliation: each run compares actual T212/Kraken holdings against what
+Reconciliation: each run compares actual T212/Kraken/Coinbase holdings against what
 the ledger's Section 104 pools account for. Any asset held in real life but
 under-explained by the ledger gets a stub OPENING row appended with Txn ID
 MANUAL:NEEDS-INPUT-<ASSET> — Value is left blank on purpose so it's flagged
@@ -686,9 +688,24 @@ def fetch_kraken_rows(since: datetime) -> list[Row]:
     )
 
 
+def fetch_coinbase_rows(since: datetime) -> list[Row]:
+    """Coinbase transactions on/after `since`, mapped to ledger Rows.
+
+    Reuses coinbase_backfill's tested history mapper (retail v2 txs + Advanced
+    Trade fills). It pulls full history, so we filter to the sync window here;
+    dedupe on the COINBASE: txid is handled by the caller's `known` set. The
+    same mapper is used pre-tax-year by the backfill tool to reconstruct
+    opening pools, so the ty_start boundary keeps the two from double-counting.
+    """
+    import coinbase_backfill
+
+    return [r for r in coinbase_backfill.fetch_coinbase_rows()
+            if r.dt is not None and r.dt >= since]
+
+
 # ---------------------------------------------------------------------------
-# Holdings reconciliation — compares real T212/Kraken balances against what
-# the ledger's Section 104 pools account for, and flags gaps.
+# Holdings reconciliation — compares real T212/Kraken/Coinbase balances against
+# what the ledger's Section 104 pools account for, and flags gaps.
 # ---------------------------------------------------------------------------
 
 def fetch_current_holdings() -> dict[str, tuple[Decimal, str]]:
@@ -712,6 +729,15 @@ def fetch_current_holdings() -> dict[str, tuple[Decimal, str]]:
                 holdings[pos["ticker"]] = (qty, "T212-Invest")
     except Exception as exc:
         print(f"WARN: T212 positions fetch failed, skipping reconciliation for GIA: {exc}",
+              file=sys.stderr)
+    try:
+        import coinbase_backfill
+
+        for asset, qty in coinbase_backfill.get_balances().items():
+            # only claim assets not already held on a synced trading venue
+            holdings.setdefault(asset, (qty, "Coinbase"))
+    except Exception as exc:
+        print(f"WARN: Coinbase balance fetch failed, skipping reconciliation for Coinbase: {exc}",
               file=sys.stderr)
     return holdings
 
@@ -1349,6 +1375,27 @@ def _print_summary(years: list[YearSummary]) -> None:
               + "  ".join(f"{v!s:>12}" for v in line[1:]))
 
 
+def _warn_flagged_rows(rows: list[Row], computed: dict[int, Computed]) -> None:
+    """Loud, consolidated summary of every row the engine flagged (⚠): missing
+    value/asset, SHORTFALL (disposal exceeds the tracked pool → a likely missing
+    acquisition on an unsynced venue), etc. Printed to stderr so it stands out in
+    the cron log — the antidote to silent gaps."""
+    flagged = [(r, computed[r.idx].match) for r in rows
+               if computed.get(r.idx) and computed[r.idx].match.startswith(WARNING_MARK)]
+    if not flagged:
+        return
+    print(f"\n{WARNING_MARK}{len(flagged)} flagged row(s) — review before filing:",
+          file=sys.stderr)
+    for r, match in flagged:
+        asset = r.asset_out or r.asset_in or "?"
+        print(f"  row {r.idx}  {date_str(r.dt)}  {r.type}  {asset}  "
+              f"[{r.wallet}]  {match.lstrip(WARNING_MARK)}", file=sys.stderr)
+    if any("SHORTFALL" in m for _, m in flagged):
+        print("  SHORTFALL = disposal larger than the Section 104 pool: an "
+              "acquisition is missing (check for an unsynced wallet/exchange).",
+              file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="UK CGT ledger sync + compute")
     parser.add_argument("--setup", action="store_true")
@@ -1356,6 +1403,11 @@ def main() -> None:
                         help="convert/refresh an existing tab in place (idempotent)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--recompute-only", action="store_true")
+    parser.add_argument("--backfill-history", action="store_true",
+                        help="one-off: inject compact Coinbase pre-tax-year "
+                             "disposal history (closed years the daily sync "
+                             "never sees) as OPENING+SELL rows, then recompute. "
+                             "Idempotent — reruns dedupe on the COINBASE: txids.")
     parser.add_argument("--sort", action="store_true",
                         help="deprecated no-op: rows are sorted by date every run")
     args = parser.parse_args()
@@ -1379,8 +1431,17 @@ def main() -> None:
         args.recompute_only = True  # formatting happens after the filter clear below
 
     new_rows: list[Row] = []
-    if not args.recompute_only:
-        for name, fetch in (("T212", fetch_t212_rows), ("Kraken", fetch_kraken_rows)):
+    if args.backfill_history:
+        import coinbase_backfill
+
+        fetched = coinbase_backfill.build_prewindow_disposal_rows(since)
+        new_rows = [r for r in fetched if r.txid not in known]
+        known.update(r.txid for r in new_rows)
+        print(f"Coinbase history backfill: {len(fetched)} rows built, "
+              f"{len(new_rows)} new (rest already present)")
+    elif not args.recompute_only:
+        for name, fetch in (("T212", fetch_t212_rows), ("Kraken", fetch_kraken_rows),
+                            ("Coinbase", fetch_coinbase_rows)):
             try:
                 fetched = fetch(since)
                 fresh = [r for r in fetched if r.txid not in known]
@@ -1393,7 +1454,7 @@ def main() -> None:
     # Reconciliation (pass-1 pools feed it; needs live APIs)
     to_append: list[Row] = []
     to_replace: list[Row] = []
-    if not args.recompute_only:
+    if not args.recompute_only and not args.backfill_history:
         _, asset_pools = compute_cgt(rows + new_rows)
         holdings = fetch_current_holdings()
         to_append, to_replace = reconcile_holdings(rows + new_rows, asset_pools,
@@ -1455,6 +1516,7 @@ def main() -> None:
     for i, r in enumerate(rows):
         r.idx = i + 2
     computed, _ = compute_cgt(rows)
+    _warn_flagged_rows(rows, computed)
 
     region_end = (marker - 1) if marker is not None else (len(rows) + 1)
     write_sorted_data(sheet_id, tab, rows, computed, region_end)

@@ -139,12 +139,41 @@ disposals — the Section 104 pool spans wallets, so moving coins doesn't
 change cost basis, but externally deposited coins need an OPENING row for
 the basis they arrived with).
 
+### Coinbase
+
+Coinbase is a **daily source** (`fetch_coinbase_rows`, alongside T212 + Kraken)
+via a CDP API key with read-only View permission (`COINBASE_API_KEY_NAME` /
+`COINBASE_API_PRIVATE_KEY` in `.env`) — any on/after-`CGT_TAX_YEAR_START`
+activity flows into the ledger automatically.
+
+`src/coinbase_backfill.py` remains for the two things the daily window can't
+reach, both reusing the same tested history mapper:
+
+```bash
+python src/coinbase_backfill.py                 # report only (read-only)
+python src/coinbase_backfill.py --write         # fill blank MANUAL:NEEDS-INPUT-<ASSET> opening stubs
+python src/cgt_ledger.py --backfill-history      # inject closed-year Coinbase disposals (see below)
+```
+
+- **Opening stubs** (`coinbase_backfill.py --write`): reconstructs the GBP cost
+  basis of coins bought on Coinbase *before* the tax-year start and later moved
+  to Kraken/self-custody, filling blank `MANUAL:NEEDS-INPUT-<ASSET>` stub Values.
+- **Closed-year disposal history** (`cgt_ledger.py --backfill-history`): coins
+  that were both **bought and sold on Coinbase in an earlier (closed) tax year**
+  never touch the daily window or current balances, so they'd silently miss the
+  record. This one-off injects them as compact `OPENING` + `SELL` rows (per
+  asset: the whole pre-window Section 104 pool collapsed into one opening, then
+  the real disposals), reproducing the exact per-year gain/loss without flooding
+  the ledger with sub-penny reward rows. Idempotent — reruns dedupe on the
+  `COINBASE:` txids. ETH is excluded (its opening stub already carries it).
+
 ### Running
 
 ```bash
 python src/cgt_ledger.py                   # sync from APIs + recompute
 python src/cgt_ledger.py --dry-run         # preview without writing
 python src/cgt_ledger.py --recompute-only  # skip APIs, just recompute
+python src/cgt_ledger.py --backfill-history # one-off: inject closed-year Coinbase disposals
 python src/cgt_ledger.py --migrate         # refresh formatting/layout on an existing tab (idempotent)
 ```
 
@@ -175,6 +204,7 @@ src/
   barclaycard.py      # Barclaycard balance (Gmail IMAP scrape)
   sheets.py           # Google Sheets client
   cgt_ledger.py       # UK CGT ledger: sync + share-matching engine
+  coinbase_backfill.py # One-off: Coinbase cost-basis backfill (NOT in daily sync)
 config/
   .env.example        # Credential template
   crontab.example     # Cron schedule

@@ -12,9 +12,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import contextlib
+import io
+
+import cgt_ledger
 from cgt_ledger import (
     SUMMARY_BLOCK_HEIGHT, SUMMARY_MARKER, Row, aea_for, build_summary_block,
-    compute_cgt, summarise_years, tax_year_of,
+    compute_cgt, fetch_coinbase_rows, summarise_years, tax_year_of,
+    _warn_flagged_rows,
 )
 
 _IDX = [0]
@@ -280,6 +285,87 @@ def test_build_summary_block_layout():
         "Losses carried forward", "Proceeds > £50k (report even if no tax due)",
         "Reward income (taxed at receipt)",
     ], labels
+
+
+def test_gap_detector_flags_shortfall():
+    # SELL with no prior acquisition => SHORTFALL: exactly the "sold on an
+    # unsynced venue" gap. The detector must surface it loudly.
+    rows = [row("2026-06-01T10:00", "SELL", out_a="XRP", out_q="100", value="500")]
+    c, _ = compute_cgt(rows)
+    assert "SHORTFALL" in c[rows[0].idx].match, c[rows[0].idx].match
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        _warn_flagged_rows(rows, c)
+    out = buf.getvalue()
+    assert "1 flagged row" in out and "XRP" in out and "SHORTFALL" in out, out
+
+
+def test_gap_detector_silent_when_clean():
+    rows = [
+        row("2026-04-05T00:00", "OPENING", in_a="ABC", in_q="100", value="1000"),
+        row("2026-06-01T10:00", "SELL", out_a="ABC", out_q="50", value="700"),
+    ]
+    c, _ = compute_cgt(rows)
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        _warn_flagged_rows(rows, c)
+    assert buf.getvalue() == "", buf.getvalue()
+
+
+def test_coinbase_source_since_filter():
+    # fetch_coinbase_rows must drop pre-window txns; the daily pipeline dedupes
+    # the rest by COINBASE: txid.
+    import coinbase_backfill
+    all_rows = [
+        row("2026-01-01T10:00", "SELL", out_a="XRP", out_q="10", value="50"),   # pre
+        row("2026-06-01T10:00", "SELL", out_a="XRP", out_q="20", value="200"),  # in
+    ]
+    orig = coinbase_backfill.fetch_coinbase_rows
+    coinbase_backfill.fetch_coinbase_rows = lambda: all_rows
+    try:
+        since = datetime(2026, 4, 6, tzinfo=timezone.utc)
+        kept = fetch_coinbase_rows(since)
+    finally:
+        coinbase_backfill.fetch_coinbase_rows = orig
+    assert [r.qty_out for r in kept] == [Decimal("20")], kept
+    assert all(r.txid.startswith("TEST:") for r in kept)  # txids preserved for dedupe
+
+
+def test_backfill_history_collapses_and_reproduces_gain():
+    # A pre-window Coinbase history: two XRP buys + one XRP disposal, plus an ETH
+    # buy (excluded — the ETH stub already carries it) and an in-window XRP sell
+    # (excluded — the daily sync ingests on/after `since`). The backfill must emit
+    # one OPENING (whole pool) + the pre-window disposal, and recompute to the
+    # exact gain the raw history yields.
+    import coinbase_backfill
+    since = datetime(2026, 4, 6, tzinfo=timezone.utc)
+    history = [
+        row("2024-06-01T10:00", "BUY", in_a="XRP", in_q="100", value="100"),
+        row("2024-07-01T10:00", "BUY", in_a="XRP", in_q="100", value="300"),
+        row("2025-02-01T10:00", "SELL", out_a="XRP", out_q="150", value="600"),
+        row("2025-03-01T10:00", "BUY", in_a="ETH", in_q="1", value="1000"),
+        row("2026-06-01T10:00", "SELL", out_a="XRP", out_q="20", value="90"),
+    ]
+    orig = coinbase_backfill.fetch_coinbase_rows
+    coinbase_backfill.fetch_coinbase_rows = lambda: history
+    try:
+        built = coinbase_backfill.build_prewindow_disposal_rows(since)
+    finally:
+        coinbase_backfill.fetch_coinbase_rows = orig
+
+    assets = {(r.type, r.asset_in or r.asset_out) for r in built}
+    assert ("OPENING", "XRP") in assets, built
+    assert all(a != "ETH" for _, a in assets), built           # ETH excluded
+    assert all(r.dt < since for r in built), built              # in-window excluded
+    opening = next(r for r in built if r.type == "OPENING")
+    assert opening.qty_in == Decimal("200") and opening.value_gbp == Decimal("400")
+
+    for i, r in enumerate(sorted(built, key=lambda r: r.dt)):
+        r.idx = i
+    c, pools = compute_cgt(sorted(built, key=lambda r: r.dt))
+    sell = next(c[r.idx] for r in built if r.type == "SELL")
+    assert sell.gain == Decimal("300"), sell.gain               # 600 - 400*150/200
+    assert pools["XRP"] == (Decimal("50"), Decimal("100")), pools["XRP"]
 
 
 if __name__ == "__main__":
