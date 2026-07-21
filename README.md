@@ -185,6 +185,36 @@ un-logged disposal, gift, or transfer to self-custody), that's never
 auto-written to the sheet — only a console warning, since it's not always a
 taxable event and shouldn't be guessed at.
 
+### RSU / share vests
+
+RSU vests use Type **`VEST`** (not `REWARD`): identical to `REWARD` in the engine
+— cost basis = `Income Taxed (GBP)` if set, else `Value (GBP)` — but a separate
+type so vests stay **visible** while crypto staking rewards remain filtered out
+of view. Sell-to-cover is a separate `SELL` row on the same vest date: the shares
+really were issued and then sold, so it is a genuine disposal (same-day matched,
+so the gain is usually just the broker fee).
+
+The basis to enter is the **payroll figure**, not the sale execution price — the
+payslip line named *Share Income* / *RSU Income* / *Share Based Payment*, divided
+by units vested. That is the amount charged to income tax, and therefore the CGT
+base cost of the retained shares. Rows still carrying an execution-price proxy
+should say `PROVISIONAL` in Notes; every run then prints a
+`⚠ N row(s) on a provisional cost basis` reminder until they're replaced.
+
+Migrate legacy `REWARD` vest rows once with
+`python src/cgt_ledger.py --migrate-rsu-vests` (idempotent; retypes rows whose
+Wallet is `Wise RSU`).
+
+The summary splits the two income kinds deliberately — **Reward income (declare
+as income)** vs **RSU/share vest income (already payroll-taxed)** — so vest value
+isn't mistakenly declared twice.
+
+### Current holdings
+
+Below the summary, a **CURRENT HOLDINGS** block lists every asset still held:
+units, Section 104 pool cost, and average cost per unit. That average is the
+base cost you'd use to work out profit on a future sale.
+
 Staking-reward and transfer rows are kept in the data — rewards carry pool
 units/cost basis and take part in 30-day matching; transfers anchor dedupe
 and reconciliation — but they're hidden from view by the tab's basic filter

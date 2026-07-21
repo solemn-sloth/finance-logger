@@ -284,8 +284,52 @@ def test_build_summary_block_layout():
         "Annual exempt amount", "Taxable gain (after losses + AEA)",
         "Estimated CGT due (basic rate, est.)",
         "Losses carried forward", "Proceeds > £50k (report even if no tax due)",
-        "Reward income (taxed at receipt)",
+        "Reward income (declare as income)",
+        "RSU/share vest income (already payroll-taxed)",
     ], labels
+
+
+def test_vest_basis_matches_reward():
+    # VEST must be basis-identical to REWARD — it exists only so RSU rows stay
+    # visible while staking rewards remain hidden by the tab filter.
+    def pool(rtype):
+        rows = [
+            row("2026-04-10T00:00", rtype, in_a="WISE", in_q="79", value="800",
+                taxed="800"),
+            row("2026-04-10T10:00", "SELL", out_a="WISE", out_q="47", value="470"),
+        ]
+        c, pools = compute_cgt(rows)
+        return pools["WISE"], c[rows[1].idx].gain
+    assert pool("VEST") == pool("REWARD")
+    (units, cost), _ = pool("VEST")
+    assert units == Decimal("32"), units          # 79 vested - 47 sold to cover
+    assert "VEST" in cgt_ledger.ACQUISITION_TYPES
+    assert "VEST" not in cgt_ledger.HIDDEN_ROW_TYPES   # the whole point
+    assert "REWARD" in cgt_ledger.HIDDEN_ROW_TYPES
+
+
+def test_income_split_reward_vs_vest():
+    rows = [
+        row("2026-05-01T00:00", "VEST", in_a="WISE", in_q="10", value="500", taxed="500"),
+        row("2026-05-02T00:00", "REWARD", in_a="ADA", in_q="5", value="20"),
+    ]
+    c, _ = compute_cgt(rows)
+    y = summarise_years(rows, c)[-1]
+    assert y.vest_income == Decimal("500"), y.vest_income
+    assert y.reward_income == Decimal("20"), y.reward_income
+
+
+def test_holdings_block():
+    pools = {
+        "WISE": (Decimal("159"), Decimal("1554.53")),
+        "GONE": (Decimal("0"), Decimal("0")),          # fully disposed — omitted
+    }
+    block = cgt_ledger.build_holdings_block(pools)
+    assert block[0] == [cgt_ledger.HOLDINGS_MARKER]
+    assert block[1] == ["Asset", "Units held", "Pool cost (GBP)", "Avg cost/unit (GBP)"]
+    assert [r[0] for r in block[2:]] == ["WISE"], block
+    assert block[2][1] == 159.0 and block[2][2] == 1554.53
+    assert round(block[2][3], 2) == 9.78                # avg cost/unit
 
 
 def test_estimated_cgt_due_rates_and_band():

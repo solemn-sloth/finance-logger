@@ -35,8 +35,12 @@ Manual row conventions:
   - Opening Section 104 pool (holdings pre-dating the tax year): one row per
     asset — Type OPENING, Asset In + Qty In, Value = pool cost in GBP,
     date it 2026-04-05, Txn ID MANUAL:OPENING-<ASSET>.
-  - RSU vest: Type REWARD, Asset In/Qty In, Value = market value at vest,
-    Income Taxed = amount already taxed through payroll (becomes cost basis).
+  - RSU/share vest: Type VEST, Asset In/Qty In, Value = market value at vest,
+    Income Taxed = amount already taxed through payroll (becomes cost basis —
+    use the payslip "Share Income" figure, not the sale execution price).
+    Sell-to-cover is a separate SELL row on the same date (the shares were
+    issued to you and then sold, so it is a real disposal). VEST rows stay
+    visible; staking REWARD rows are hidden by the tab filter.
   - Any manual Txn ID must be unique, prefix MANUAL: recommended.
 
 Reconciliation: each run compares actual T212/Kraken/Coinbase holdings against what
@@ -90,7 +94,11 @@ RECONCILE_TOLERANCE = Decimal("0.000001")
 WARNING_MARK = "⚠ "
 
 DISPOSAL_TYPES = {"SELL", "SWAP"}
-ACQUISITION_TYPES = {"BUY", "SWAP", "REWARD", "OPENING"}
+ACQUISITION_TYPES = {"BUY", "SWAP", "REWARD", "VEST", "OPENING"}
+# VEST behaves exactly like REWARD in the engine (cost basis = the amount already
+# taxed as income), but is a separate type so RSU/share vests stay VISIBLE while
+# crypto staking rewards remain filtered out of view — see HIDDEN_ROW_TYPES.
+INCOME_ACQUISITION_TYPES = {"REWARD", "VEST"}
 KNOWN_TYPES = DISPOSAL_TYPES | ACQUISITION_TYPES | {"TRANSFER_IN", "TRANSFER_OUT", "FEE"}
 
 # Kept in the data (pool cost, matching and dedupe correctness) but hidden
@@ -301,7 +309,7 @@ def _events(rows: list[Row]) -> tuple[list[_Acq], list[_Disp]]:
             continue
         fee = r.fee_gbp or Decimal(0)
         value = r.value_gbp or Decimal(0)
-        if r.type in ("BUY", "REWARD", "OPENING"):
+        if r.type in ("BUY", "REWARD", "VEST", "OPENING"):
             if not r.asset_in or not r.qty_in:
                 r.warning = "MISSING ASSET/QTY IN"
                 continue
@@ -310,7 +318,9 @@ def _events(rows: list[Row]) -> tuple[list[_Acq], list[_Disp]]:
                     r.warning = "MISSING VALUE"
                     continue
                 cost = value + fee
-            elif r.type == "REWARD":
+            elif r.type in INCOME_ACQUISITION_TYPES:
+                # REWARD (staking) and VEST (RSU): basis = the amount already
+                # charged to income tax at receipt, else the market value.
                 if r.value_gbp is None and r.income_taxed is None:
                     r.warning = "MISSING VALUE"
                     continue
@@ -983,7 +993,7 @@ def reconcile_holdings(
 # ---------------------------------------------------------------------------
 
 SUMMARY_MARKER = "CGT SUMMARY"
-SUMMARY_BLOCK_HEIGHT = 15
+SUMMARY_BLOCK_HEIGHT = 16
 
 
 def read_ledger(sheet_id: str, tab: str) -> tuple[list[Row], int | None]:
@@ -1011,6 +1021,9 @@ def read_ledger(sheet_id: str, tab: str) -> tuple[list[Row], int | None]:
     if marker_row is not None:
         below = marker_row - 2 + SUMMARY_BLOCK_HEIGHT
         for j, cells in enumerate(values[below:]):
+            # the script's own holdings block lives here — stop at its marker
+            if cells and str(cells[0]).strip() == HOLDINGS_MARKER:
+                break
             if any(str(c).strip() for c in cells):
                 print(f"WARN: row {below + j + 2} is below the summary block and is "
                       f"ignored — move transactions above the '{SUMMARY_MARKER}' row.",
@@ -1121,7 +1134,8 @@ class YearSummary:
     taxable: Decimal
     tax_due: Decimal          # estimated CGT on the taxable gain (see cgt_rate_for)
     losses_cf: Decimal        # carried into the next year
-    reward_income: Decimal
+    reward_income: Decimal    # staking/misc rewards — declarable income
+    vest_income: Decimal      # RSU/share vests — already taxed via payroll
 
 
 def summarise_years(rows: list[Row], computed: dict[int, Computed],
@@ -1167,21 +1181,28 @@ def summarise_years(rows: list[Row], computed: dict[int, Computed],
             bf_used = Decimal(0)
             taxable = Decimal(0)
             cf = pool - net
-        reward_income = sum(
-            ((r.income_taxed if r.income_taxed is not None else r.value_gbp) or Decimal(0)
-             for r in rows if r.type == "REWARD" and r.dt and ty(r) == year),
-            Decimal(0),
-        )
+        def _income(row_type: str) -> Decimal:
+            return sum(
+                ((r.income_taxed if r.income_taxed is not None else r.value_gbp)
+                 or Decimal(0)
+                 for r in rows if r.type == row_type and r.dt and ty(r) == year),
+                Decimal(0),
+            )
+        # Split deliberately: staking rewards are declarable misc income, RSU
+        # vests were already taxed through payroll and must NOT be re-declared.
+        reward_income = _income("REWARD")
+        vest_income = _income("VEST")
         tax_due = (taxable * cgt_rate_for(year, higher_rate)).quantize(Decimal("0.01"))
         out.append(YearSummary(year, len(disposals), proceeds, gains, losses, net,
-                               pool, bf_used, aea, taxable, tax_due, cf, reward_income))
+                               pool, bf_used, aea, taxable, tax_due, cf,
+                               reward_income, vest_income))
         pool = cf
     return out
 
 
 def build_summary_block(years: list[YearSummary], now: datetime,
                         band_label: str = "basic rate") -> list[list]:
-    """The 15-row summary block (marker row included): labels in column A,
+    """The 16-row summary block (marker row included): labels in column A,
     one column per tax year. Numeric cells are numbers, never strings."""
     def per(fn):
         return [fn(y) for y in years]
@@ -1201,7 +1222,9 @@ def build_summary_block(years: list[YearSummary], now: datetime,
         ["Losses carried forward"] + per(lambda y: _num(y.losses_cf)),
         ["Proceeds > £50k (report even if no tax due)"]
         + per(lambda y: "YES" if y.proceeds > PROCEEDS_REPORTING_THRESHOLD else "NO"),
-        ["Reward income (taxed at receipt)"] + per(lambda y: _num(y.reward_income)),
+        ["Reward income (declare as income)"] + per(lambda y: _num(y.reward_income)),
+        ["RSU/share vest income (already payroll-taxed)"]
+        + per(lambda y: _num(y.vest_income)),
     ]
 
 
@@ -1237,12 +1260,13 @@ def _gain_color_rule(condition_type: str, color: dict) -> dict:
     }
 
 
-_TYPES_ARRAY = '{"BUY";"SELL";"SWAP";"REWARD";"OPENING";"TRANSFER_IN";"TRANSFER_OUT";"FEE"}'
+_TYPES_ARRAY = ('{"BUY";"SELL";"SWAP";"REWARD";"VEST";"OPENING";'
+                '"TRANSFER_IN";"TRANSFER_OUT";"FEE"}')
 CONDITIONAL_RULES = [
     # Value (G) required but missing
     _highlight_rule(
         '=AND($G2="", OR($B2="BUY",$B2="SELL",$B2="SWAP",$B2="OPENING",'
-        ' AND($B2="REWARD",$M2="")))', 6, 7),
+        ' AND(OR($B2="REWARD",$B2="VEST"),$M2="")))', 6, 7),
     # Date (A) missing on a non-empty row
     _highlight_rule('=AND($A2="", $B2<>"")', 0, 1),
     # Type (B) unrecognised
@@ -1251,7 +1275,8 @@ CONDITIONAL_RULES = [
     _highlight_rule('=AND(OR($B2="SELL",$B2="SWAP"), OR($C2="",$D2=""))', 2, 4),
     # Asset/Qty In (E:F) missing on an acquisition
     _highlight_rule(
-        '=AND(OR($B2="BUY",$B2="REWARD",$B2="OPENING",$B2="SWAP"), OR($E2="",$F2=""))', 4, 6),
+        '=AND(OR($B2="BUY",$B2="REWARD",$B2="VEST",$B2="OPENING",$B2="SWAP"),'
+        ' OR($E2="",$F2=""))', 4, 6),
     # Gain/Loss (T) green/red
     _gain_color_rule("NUMBER_GREATER", _GREEN),
     _gain_color_rule("NUMBER_LESS", _RED),
@@ -1323,11 +1348,57 @@ def write_summary(sheet_id: str, tab: str, marker_row: int,
         ({"startRowIndex": m0 + 3, "endRowIndex": m0 + 13,
           "startColumnIndex": 1, "endColumnIndex": ncols},
          _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
-        # currency: Reward income
+        # currency: Reward income + RSU vest income
         ({"startRowIndex": m0 + 14, "endRowIndex": m0 + SUMMARY_BLOCK_HEIGHT,
           "startColumnIndex": 1, "endColumnIndex": ncols},
          _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
     ])
+
+
+HOLDINGS_MARKER = "CURRENT HOLDINGS"
+
+
+def build_holdings_block(pools: dict[str, tuple[Decimal, Decimal]]) -> list[list]:
+    """Asset | Units held | Pool cost | Avg cost per unit, for every asset still
+    held. This is the 'what is my basis if I sell today' view — the per-row Pool
+    Cost After columns already carry it, but only on that asset's last row."""
+    held = sorted((a, u, c) for a, (u, c) in pools.items() if u > RECONCILE_TOLERANCE)
+    block = [[HOLDINGS_MARKER],
+             ["Asset", "Units held", "Pool cost (GBP)", "Avg cost/unit (GBP)"]]
+    for asset, units, cost in held:
+        # units at full precision (2dp would collapse crypto dust to "0");
+        # avg cost/unit at 4dp so sub-penny assets stay meaningful
+        block.append([asset, _num(units, 8), _num(cost),
+                      _num(cost / units, 4) if units else ""])
+    return block
+
+
+def write_holdings(sheet_id: str, tab: str, start_row: int,
+                   pools: dict[str, tuple[Decimal, Decimal]]) -> int:
+    """Write the holdings block at A{start_row}; returns rows written."""
+    block = build_holdings_block(pools)
+    sheets.clear_range(sheet_id, tab, f"A{start_row}:D{start_row + 60}")
+    sheets.write_range(sheet_id, tab, f"A{start_row}", block)
+    s0 = start_row - 1  # 0-based
+    bold = {"textFormat": {"bold": True}}
+    sheets.apply_formats(sheet_id, tab, [
+        ({"startRowIndex": s0, "endRowIndex": s0 + 1,
+          "startColumnIndex": 0, "endColumnIndex": 4},
+         {**bold, "backgroundColor": _SUMMARY_FILL},
+         "userEnteredFormat(textFormat.bold,backgroundColor)"),
+        ({"startRowIndex": s0 + 1, "endRowIndex": s0 + 2,
+          "startColumnIndex": 0, "endColumnIndex": 4},
+         bold, "userEnteredFormat.textFormat.bold"),
+        # units: full precision — 2dp would show crypto dust as "0"
+        ({"startRowIndex": s0 + 2, "endRowIndex": s0 + len(block),
+          "startColumnIndex": 1, "endColumnIndex": 2},
+         {"numberFormat": {"type": "NUMBER", "pattern": "0.########"}},
+         "userEnteredFormat.numberFormat"),
+        ({"startRowIndex": s0 + 2, "endRowIndex": s0 + len(block),
+          "startColumnIndex": 2, "endColumnIndex": 4},
+         _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+    ])
+    return len(block)
 
 
 def apply_dynamic_bounds(sheet_id: str, tab: str, n_data: int) -> None:
@@ -1417,6 +1488,23 @@ def _warn_flagged_rows(rows: list[Row], computed: dict[int, Computed]) -> None:
               file=sys.stderr)
 
 
+def _warn_provisional_basis(rows: list[Row]) -> None:
+    """RSU vests entered with the sell-to-cover execution price standing in for
+    the real payroll vest FMV carry a PROVISIONAL note. Their cost basis — and
+    so the gain on every future disposal of those shares — is approximate, so
+    keep saying so until the note is removed."""
+    prov = [r for r in rows if "PROVISIONAL" in (r.notes or "").upper()]
+    if not prov:
+        return
+    print(f"\n{WARNING_MARK}{len(prov)} row(s) on a provisional cost basis — "
+          f"replace with the payroll vest FMV (payslip 'Share Income' ÷ units):",
+          file=sys.stderr)
+    for r in prov:
+        asset = r.asset_in or r.asset_out or "?"
+        print(f"  {date_str(r.dt)}  {r.type}  {asset}  {r.qty_in or r.qty_out}  "
+              f"[{r.wallet}]", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="UK CGT ledger sync + compute")
     parser.add_argument("--setup", action="store_true")
@@ -1429,6 +1517,10 @@ def main() -> None:
                              "disposal history (closed years the daily sync "
                              "never sees) as OPENING+SELL rows, then recompute. "
                              "Idempotent — reruns dedupe on the COINBASE: txids.")
+    parser.add_argument("--migrate-rsu-vests", action="store_true",
+                        help="one-off: retype Wise RSU vest rows from REWARD to "
+                             "VEST so they stop being hidden by the row filter. "
+                             "Idempotent.")
     parser.add_argument("--sort", action="store_true",
                         help="deprecated no-op: rows are sorted by date every run")
     args = parser.parse_args()
@@ -1453,6 +1545,20 @@ def main() -> None:
 
     if args.migrate:
         args.recompute_only = True  # formatting happens after the filter clear below
+
+    if args.migrate_rsu_vests:
+        # No API work needed — this only retypes rows already in the sheet, then
+        # falls through the normal sort/compute/write path.
+        args.recompute_only = True
+        retyped = [r for r in rows if r.type == "REWARD" and r.wallet == "Wise RSU"]
+        for r in retyped:
+            r.type = "VEST"
+            # write_sorted_data replays input cells verbatim from Row.raw, so the
+            # raw Type cell (column B) has to change too or the edit won't persist
+            if r.raw and len(r.raw) > 1:
+                r.raw[1] = "VEST"
+        print(f"Retyped {len(retyped)} Wise RSU row(s): REWARD → VEST "
+              f"(they will no longer be hidden by the row filter)")
 
     new_rows: list[Row] = []
     if args.backfill_history:
@@ -1540,8 +1646,9 @@ def main() -> None:
     rows.sort(key=lambda r: (r.dt or datetime.max.replace(tzinfo=UTC)))
     for i, r in enumerate(rows):
         r.idx = i + 2
-    computed, _ = compute_cgt(rows)
+    computed, asset_pools_final = compute_cgt(rows)
     _warn_flagged_rows(rows, computed)
+    _warn_provisional_basis(rows)
 
     region_end = (marker - 1) if marker is not None else (len(rows) + 1)
     write_sorted_data(sheet_id, tab, rows, computed, region_end)
@@ -1550,6 +1657,8 @@ def main() -> None:
                             higher_rate=higher_rate)
     marker_row = marker if marker is not None else len(rows) + 3
     write_summary(sheet_id, tab, marker_row, years, band_label=band_label)
+    write_holdings(sheet_id, tab, marker_row + SUMMARY_BLOCK_HEIGHT + 1,
+                   asset_pools_final)
     apply_dynamic_bounds(sheet_id, tab, len(rows))
     latest = years[-1]
     print(f"Computed columns + summary written. {tax_year_label(latest.year)}: "
