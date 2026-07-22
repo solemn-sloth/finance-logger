@@ -215,6 +215,36 @@ Below the summary, a **CURRENT HOLDINGS** block lists every asset still held:
 units, Section 104 pool cost, and average cost per unit. That average is the
 base cost you'd use to work out profit on a future sale.
 
+Assets whose pool cost is under `CGT_HOLDINGS_MIN_COST` (default £1) are left out
+and named in a one-line footnote instead — crypto dust otherwise dominates the
+list. They remain **fully tracked** in the Section 104 pools; only the display is
+filtered. The threshold is on pool *cost*, not market value (the ledger holds no
+prices), so a cheap-basis asset that has risen a lot could in principle be hidden;
+set `CGT_HOLDINGS_MIN_COST=0` to show everything.
+
+Dust cannot simply be deleted from the record. A **negligible value claim**
+(TCGA 1992 s.24(2), HMRC [CRYPTO22500]) only applies where the *asset* has
+**become** "worth next to nothing" while you owned it, and it must be claimed over
+the **whole Section 104 pool**, not the leftover tokens — so it does not cover a
+small holding of a coin that still trades. If a token ever does become genuinely
+worthless (or its keys are lost — CRYPTO22400), record the claim as a `SELL` row
+for the whole pool, dated the claim date, Value `0`, noted
+`s24 negligible value claim`.
+
+### Cell formatting is yours
+
+Outside `--setup` / `--migrate`, the script **only ever writes values** — every
+block, including the summary and holdings, goes through
+`sheets.write_values_grid` (`updateCells` with `fields=userEnteredValue`), which
+leaves cell formatting untouched. Restyle any column or cell and it survives the
+nightly run. `--setup` / `--migrate` lay down a sensible baseline and are the only
+things that impose formatting.
+
+Consequence: a brand-new tax-year column or holdings row arrives unstyled until
+you format it or re-run `--migrate`. Quantity columns use **Automatic** rather
+than a fixed pattern, because a Sheets pattern always renders its decimal point
+(`0.########` displays a whole number as `5.`).
+
 Staking-reward and transfer rows are kept in the data — rewards carry pool
 units/cost basis and take part in 30-day matching; transfers anchor dedupe
 and reconciliation — but they're hidden from view by the tab's basic filter

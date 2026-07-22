@@ -270,9 +270,9 @@ def test_build_summary_block_layout():
         row("2026-06-01T10:00", "SELL", out_a="ABC", out_q="10", value="3000"),
     ]
     ys = _years(rows)
-    block = build_summary_block(ys, datetime(2026, 7, 1, tzinfo=timezone.utc))
+    block = build_summary_block(ys)
     assert len(block) == SUMMARY_BLOCK_HEIGHT
-    assert block[0][0] == SUMMARY_MARKER
+    assert block[0] == [SUMMARY_MARKER, "", ""]   # no 'Last updated' timestamp
     assert block[1] == ["Tax year", "2026/27"]
     assert block[2] == ["Disposals", 1]
     assert isinstance(block[3][1], float) and block[3][1] == 3000.0   # proceeds
@@ -330,6 +330,27 @@ def test_holdings_block():
     assert [r[0] for r in block[2:]] == ["WISE"], block
     assert block[2][1] == 159.0 and block[2][2] == 1554.53
     assert round(block[2][3], 2) == 9.78                # avg cost/unit
+
+
+def test_holdings_dust_hidden_but_still_tracked():
+    # Dust stays in the Section 104 pool (a negligible value claim doesn't apply
+    # to a small holding of a token that still trades) — it's only hidden here.
+    pools = {
+        "WISE": (Decimal("159"), Decimal("1554.53")),
+        "ADA": (Decimal("2.18"), Decimal("0.63")),
+        "SHIB": (Decimal("713"), Decimal("0.01")),
+    }
+    block = cgt_ledger.build_holdings_block(pools)
+    assert [r[0] for r in block[2:-1]] == ["WISE"], block
+    footer = block[-1][0]
+    assert footer.startswith("Dust hidden (still tracked for CGT):"), footer
+    assert "ADA" in footer and "SHIB" in footer
+    assert "£0.64" in footer, footer          # 0.63 + 0.01 combined
+
+    # threshold 0 disables hiding entirely — everything reappears, no footnote
+    everything = cgt_ledger.build_holdings_block(pools, min_cost=Decimal(0))
+    assert [r[0] for r in everything[2:]] == ["ADA", "SHIB", "WISE"], everything
+    assert not any("Dust hidden" in str(r[0]) for r in everything)
 
 
 def test_estimated_cgt_due_rates_and_band():

@@ -903,7 +903,10 @@ def reconcile_holdings(
     for r in rows:
         if r.dt is None or r.warning:
             continue
-        if r.type in ("BUY", "REWARD", "OPENING", "SWAP") and r.asset_in:
+        # ACQUISITION_TYPES, not a literal list: a new acquisition type missing
+        # from here makes its asset look under-tracked and fabricates a
+        # NEEDS-INPUT stub (VEST did exactly that when it was introduced).
+        if r.type in ACQUISITION_TYPES and r.asset_in:
             flows[r.asset_in] = flows.get(r.asset_in, Decimal(0)) + (r.qty_in or Decimal(0))
         if r.type in ("SELL", "SWAP") and r.asset_out:
             flows[r.asset_out] = flows.get(r.asset_out, Decimal(0)) - (r.qty_out or Decimal(0))
@@ -1200,14 +1203,17 @@ def summarise_years(rows: list[Row], computed: dict[int, Computed],
     return out
 
 
-def build_summary_block(years: list[YearSummary], now: datetime,
+def build_summary_block(years: list[YearSummary],
                         band_label: str = "basic rate") -> list[list]:
     """The 16-row summary block (marker row included): labels in column A,
     one column per tax year. Numeric cells are numbers, never strings."""
     def per(fn):
         return [fn(y) for y in years]
     return [
-        [SUMMARY_MARKER, "Last updated (UTC)", iso(now)],
+        # B and C written empty on purpose: they used to carry a "Last updated"
+        # timestamp the user removed, and blanks here clear it rather than
+        # leaving the stale text behind.
+        [SUMMARY_MARKER, "", ""],
         ["Tax year"] + per(lambda y: tax_year_label(y.year)),
         ["Disposals"] + per(lambda y: y.disposals),
         ["Total proceeds"] + per(lambda y: _num(y.proceeds)),
@@ -1315,12 +1321,19 @@ _CURRENCY_FMT = {"numberFormat": {"type": "CURRENCY", "pattern": "£#,##0.00"}}
 
 def write_summary(sheet_id: str, tab: str, marker_row: int,
                   years: list[YearSummary], now: datetime | None = None,
-                  band_label: str = "basic rate") -> None:
-    """Write the summary block at A{marker_row} and style it (banner fill,
-    bold labels/year headers, £ formats). Block-bounded and idempotent —
-    overrides any data-column formats bleeding into these rows."""
-    block = build_summary_block(years, now or datetime.now(UTC), band_label)
-    sheets.write_range(sheet_id, tab, f"A{marker_row}", block)
+                  band_label: str = "basic rate", style: bool = False) -> None:
+    """Write the summary block at A{marker_row}.
+
+    Values are written via write_values_grid (updateCells, fields=
+    userEnteredValue) so the user's own cell formatting always survives —
+    values.update with RAW would reset the cells and strip their formats.
+    Styling (banner fill, bold labels, £ formats) is applied only when
+    style=True, i.e. from --setup/--migrate: outside those, formatting on this
+    tab belongs to the user and the script must not fight it."""
+    block = build_summary_block(years, band_label)
+    sheets.write_values_grid(sheet_id, tab, marker_row, 1, block)
+    if not style:
+        return
     m0 = marker_row - 1  # 0-based
     ncols = 1 + len(years)
     bold = {"textFormat": {"bold": True}}
@@ -1356,29 +1369,51 @@ def write_summary(sheet_id: str, tab: str, marker_row: int,
 
 
 HOLDINGS_MARKER = "CURRENT HOLDINGS"
+_HOLDINGS_SLACK = 20   # blank rows written after the block to clear stale rows
 
 
-def build_holdings_block(pools: dict[str, tuple[Decimal, Decimal]]) -> list[list]:
+def build_holdings_block(pools: dict[str, tuple[Decimal, Decimal]],
+                         min_cost: Decimal = Decimal("1.00")) -> list[list]:
     """Asset | Units held | Pool cost | Avg cost per unit, for every asset still
     held. This is the 'what is my basis if I sell today' view — the per-row Pool
     Cost After columns already carry it, but only on that asset's last row."""
     held = sorted((a, u, c) for a, (u, c) in pools.items() if u > RECONCILE_TOLERANCE)
+    shown = [h for h in held if h[2] >= min_cost]
+    dust = [h for h in held if h[2] < min_cost]
     block = [[HOLDINGS_MARKER],
              ["Asset", "Units held", "Pool cost (GBP)", "Avg cost/unit (GBP)"]]
-    for asset, units, cost in held:
+    for asset, units, cost in shown:
         # units at full precision (2dp would collapse crypto dust to "0");
         # avg cost/unit at 4dp so sub-penny assets stay meaningful
         block.append([asset, _num(units, 8), _num(cost),
                       _num(cost / units, 4) if units else ""])
+    if dust:
+        # Never drop an owned asset silently. These stay in the Section 104
+        # pools: a negligible value claim (TCGA92 s24(2), HMRC CRYPTO22500)
+        # tests whether the *asset* has become worth next to nothing and must
+        # cover the whole pool — it does not apply to a small leftover holding
+        # of a token that still trades.
+        total = sum((c for _, _, c in dust), Decimal(0))
+        block.append([f"Dust hidden (still tracked for CGT): "
+                      f"{', '.join(a for a, _, _ in dust)} — combined cost "
+                      f"£{total:.2f}"])
     return block
 
 
 def write_holdings(sheet_id: str, tab: str, start_row: int,
-                   pools: dict[str, tuple[Decimal, Decimal]]) -> int:
-    """Write the holdings block at A{start_row}; returns rows written."""
-    block = build_holdings_block(pools)
-    sheets.clear_range(sheet_id, tab, f"A{start_row}:D{start_row + 60}")
-    sheets.write_range(sheet_id, tab, f"A{start_row}", block)
+                   pools: dict[str, tuple[Decimal, Decimal]],
+                   min_cost: Decimal = Decimal("1.00"),
+                   style: bool = False) -> int:
+    """Write the holdings block at A{start_row}; returns rows written.
+
+    Values only by default — cell formatting is the user's to own (see
+    write_summary). Styling is applied on --setup/--migrate via style=True."""
+    block = build_holdings_block(pools, min_cost)
+    # pad so a shrinking block clears stale rows by VALUE (formats survive)
+    padded = block + [["", "", "", ""] for _ in range(_HOLDINGS_SLACK)]
+    sheets.write_values_grid(sheet_id, tab, start_row, 1, padded)
+    if not style:
+        return len(block)
     s0 = start_row - 1  # 0-based
     bold = {"textFormat": {"bold": True}}
     sheets.apply_formats(sheet_id, tab, [
@@ -1389,11 +1424,10 @@ def write_holdings(sheet_id: str, tab: str, start_row: int,
         ({"startRowIndex": s0 + 1, "endRowIndex": s0 + 2,
           "startColumnIndex": 0, "endColumnIndex": 4},
          bold, "userEnteredFormat.textFormat.bold"),
-        # units: full precision — 2dp would show crypto dust as "0"
+        # units: Automatic, matching the ledger's quantity columns
         ({"startRowIndex": s0 + 2, "endRowIndex": s0 + len(block),
           "startColumnIndex": 1, "endColumnIndex": 2},
-         {"numberFormat": {"type": "NUMBER", "pattern": "0.########"}},
-         "userEnteredFormat.numberFormat"),
+         {}, "userEnteredFormat.numberFormat"),
         ({"startRowIndex": s0 + 2, "endRowIndex": s0 + len(block),
           "startColumnIndex": 2, "endColumnIndex": 4},
          _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
@@ -1433,9 +1467,12 @@ def _apply_formatting(sheet_id: str, tab: str, data_end: int) -> None:
     formats.append((_col_range(0, data_end),
                     {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}},
                     "userEnteredFormat.numberFormat"))
-    for col in (3, 5, 15, 17):  # quantity columns: full precision, no fake 0.00
-        formats.append((_col_range(col, data_end),
-                        {"numberFormat": {"type": "NUMBER", "pattern": "0.########"}},
+    for col in (3, 5, 15, 17):  # quantity columns
+        # Automatic (cleared numberFormat), not a pattern: a Sheets pattern
+        # always renders its literal decimal point, so "0.########" displays a
+        # whole number as "5.". An empty format dict with the numberFormat
+        # fields mask resets the field to automatic.
+        formats.append((_col_range(col, data_end), {},
                         "userEnteredFormat.numberFormat"))
     for col in (6, 8, 12, 16, 18, 19):  # GBP columns
         formats.append((_col_range(col, data_end), _CURRENCY_FMT,
@@ -1450,7 +1487,8 @@ def _apply_formatting(sheet_id: str, tab: str, data_end: int) -> None:
 def setup_tab(sheet_id: str, tab: str, losses_bf: Decimal) -> None:
     created = sheets.ensure_tab(sheet_id, tab)
     _apply_formatting(sheet_id, tab, data_end=2)  # row 2 = spacer/template
-    write_summary(sheet_id, tab, 3, summarise_years([], {}, losses_bf=losses_bf))
+    write_summary(sheet_id, tab, 3, summarise_years([], {}, losses_bf=losses_bf),
+                  style=True)
     apply_dynamic_bounds(sheet_id, tab, 0)
     print(f"Tab '{tab}' {'created' if created else 'already existed'}; "
           f"formatting + summary block applied.")
@@ -1461,7 +1499,7 @@ def setup_tab(sheet_id: str, tab: str, losses_bf: Decimal) -> None:
 # ---------------------------------------------------------------------------
 
 def _print_summary(years: list[YearSummary], band_label: str = "basic rate") -> None:
-    block = build_summary_block(years, datetime.now(UTC), band_label)
+    block = build_summary_block(years, band_label)
     for line in block[1:]:
         print("  " + str(line[0]).ljust(44)
               + "  ".join(f"{v!s:>12}" for v in line[1:]))
@@ -1530,6 +1568,11 @@ def main() -> None:
     ty_start = date.fromisoformat(os.getenv("CGT_TAX_YEAR_START", "2026-04-06"))
     since = datetime(ty_start.year, ty_start.month, ty_start.day, tzinfo=UTC)
     losses_bf = _dec(os.getenv("CGT_LOSSES_BF"), Decimal(0))
+    # Holdings dust threshold: assets whose pool cost is below this are hidden
+    # from the holdings block (still tracked in full). 0 shows everything.
+    holdings_min_cost = _dec(os.getenv("CGT_HOLDINGS_MIN_COST"), Decimal("1.00"))
+    # Formatting belongs to the user: only setup/migrate lay down a baseline.
+    style_blocks = bool(args.setup or args.migrate)
     # Estimated-CGT-due row: which rate band to price the taxable gain at.
     higher_rate = os.getenv("CGT_TAXPAYER_BAND", "basic").strip().lower() == "higher"
     band_label = "higher rate" if higher_rate else "basic rate"
@@ -1656,9 +1699,11 @@ def main() -> None:
     years = summarise_years(rows, computed, losses_bf=losses_bf,
                             higher_rate=higher_rate)
     marker_row = marker if marker is not None else len(rows) + 3
-    write_summary(sheet_id, tab, marker_row, years, band_label=band_label)
+    write_summary(sheet_id, tab, marker_row, years, band_label=band_label,
+                  style=style_blocks)
     write_holdings(sheet_id, tab, marker_row + SUMMARY_BLOCK_HEIGHT + 1,
-                   asset_pools_final)
+                   asset_pools_final, min_cost=holdings_min_cost,
+                   style=style_blocks)
     apply_dynamic_bounds(sheet_id, tab, len(rows))
     latest = years[-1]
     print(f"Computed columns + summary written. {tax_year_label(latest.year)}: "
