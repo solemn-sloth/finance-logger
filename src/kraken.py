@@ -53,10 +53,33 @@ def _private_post(endpoint: str, params: dict | None = None) -> dict:
 
 
 def get_total_balance() -> float:
-    """Return total account value in GBP (equivalent balance via TradeBalance)."""
-    result = _private_post("TradeBalance", {"asset": "ZGBP"})
-    # 'eb' = equivalent balance: total value of all holdings in the base currency
-    return round(float(result["eb"]), 2)
+    """Return total account value in GBP, valuing every holding at its current
+    price — including staked/Earn assets.
+
+    NB: TradeBalance's 'eb' (equivalent balance) covers only the *spot* wallet,
+    so anything allocated to Kraken Earn/staking (e.g. ETH held as ETH2.S) is
+    excluded and the total collapses to near-zero. We therefore sum the Balance
+    endpoint (which does report staked variants) valued at live Ticker prices.
+    Best-effort: an asset that can't be priced is warned about and skipped, not
+    fatal, so one odd coin never zeroes the whole figure."""
+    from decimal import Decimal
+
+    by_asset: dict[str, Decimal] = {}
+    for raw_asset, amount in _private_post("Balance").items():
+        qty = Decimal(str(amount))
+        if qty <= Decimal("0.00000001"):
+            continue
+        asset = normalize_asset(raw_asset)  # ETH2.S / ETH.F -> ETH, spot + staked merge
+        by_asset[asset] = by_asset.get(asset, Decimal(0)) + qty
+
+    total = Decimal(0)
+    for asset, qty in by_asset.items():
+        try:
+            total += current_gbp_value(asset, qty)
+        except Exception as exc:
+            print(f"WARN: Kraken could not value {qty.normalize():f} {asset} in GBP, "
+                  f"excluded from total: {exc}", file=sys.stderr)
+    return round(float(total), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +173,37 @@ def _daily_close(base: str, quote: str, day_ts: int):
             raise RuntimeError(f"No OHLC candle for {alt} at {day_ts}")
         _ohlc_cache[key] = Decimal(str(rows[0][4]))
     return _ohlc_cache[key]
+
+
+def _ticker_last(base: str, quote: str):
+    """Current last-trade price for base/quote via the public Ticker (Decimal)."""
+    from decimal import Decimal
+
+    alt = _pairs()[1].get((base, quote))
+    if not alt:
+        raise RuntimeError(f"No Kraken pair for {base}/{quote}")
+    result = _public_get("Ticker", {"pair": alt})
+    row = next(iter(result.values()))
+    return Decimal(str(row["c"][0]))  # 'c' = [last-trade price, lot volume]
+
+
+def current_gbp_value(asset: str, amount):
+    """Value `amount` of `asset` in GBP at the current market price (Decimal).
+    Same GBP routing as get_gbp_value — direct pair, inverse, or via USD — but
+    using live Ticker prices instead of a historical daily close."""
+    from decimal import Decimal
+
+    amount = Decimal(str(amount))
+    if asset == "GBP":
+        return amount
+    by_assets = _pairs()[1]
+    if (asset, "GBP") in by_assets:
+        return amount * _ticker_last(asset, "GBP")
+    if ("GBP", asset) in by_assets:
+        return amount / _ticker_last("GBP", asset)
+    if (asset, "USD") in by_assets and ("GBP", "USD") in by_assets:
+        return amount * _ticker_last(asset, "USD") / _ticker_last("GBP", "USD")
+    raise RuntimeError(f"No GBP valuation route for {asset}")
 
 
 def get_gbp_value(asset: str, amount, on_date) -> tuple:
