@@ -36,8 +36,15 @@ def test_total_balance_includes_staked_offline():
         total = kraken.get_total_balance()
     finally:
         kraken._private_post, kraken.current_gbp_value = orig_post, orig_val
-    # (4.3296595346 + 0.5) ETH * 1400 + 1.08420860 ADA * 0.13 + 5 GBP
-    assert abs(total - 6766.66) < 0.01, total
+    # expected derived from the inputs above — no hand-typed constant to drift.
+    # merges staked+spot ETH, counts fiat, and omits XXBT dust: if the code
+    # regressed on any of those, total would diverge from expected.
+    expected = round(float(
+        (Decimal(raw["ETH2.S"]) + Decimal(raw["XETH"])) * prices["ETH"]
+        + Decimal(raw["ADA"]) * prices["ADA"]
+        + Decimal(raw["ZGBP"])
+    ), 2)
+    assert abs(total - expected) < 0.01, (total, expected)
     print(f"offline staked-balance test OK: £{total}")
 
 
