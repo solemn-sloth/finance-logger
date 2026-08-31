@@ -103,19 +103,27 @@ def get_transactions(access_token: str, since: str, before: str) -> list[dict]:
     Requires 'transactions' scope on the OAuth client.
     """
     account_id = _get_account_id(access_token)
-    resp = requests.get(
-        f"{MONZO_API}/transactions",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={
-            "account_id": account_id,
-            "since": since,
-            "before": before,
-            "expand[]": "merchant",
-        },
-        timeout=30,
-    )
-    if not resp.ok:
-        raise RuntimeError(f"Monzo transactions fetch failed: {resp.status_code} {resp.text}")
-    return resp.json().get("transactions", [])
+    txs: list[dict] = []
+    cursor = since
+    while True:
+        resp = requests.get(
+            f"{MONZO_API}/transactions",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={
+                "account_id": account_id,
+                "since": cursor,
+                "before": before,
+                "limit": 100,
+                "expand[]": "merchant",
+            },
+            timeout=30,
+        )
+        if not resp.ok:
+            raise RuntimeError(f"Monzo transactions fetch failed: {resp.status_code} {resp.text}")
+        batch = resp.json().get("transactions", [])
+        txs.extend(batch)
+        if len(batch) < 100:
+            return txs
+        cursor = batch[-1]["id"]  # since also accepts a tx id for pagination
 
 

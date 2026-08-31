@@ -6,6 +6,7 @@ filters out inter-account transfers, and computes monthly income/expense totals.
 """
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -33,7 +34,8 @@ def get_monzo_wise_topups(monzo_txs: list[dict]) -> float:
             or tx.get("description", "")
             or tx.get("notes", "")
         ).lower()
-        if "wise" in desc or "transferwise" in desc:
+        # Outgoing only — incoming credits from Wise (e.g. salary) are not topups
+        if tx["amount"] < 0 and ("wise" in desc or "transferwise" in desc):
             total += abs(tx["amount"]) / 100
     return round(total, 2)
 
@@ -61,14 +63,28 @@ class Transaction:
     raw: dict
 
 
+def _income_exclude_patterns() -> list[str]:
+    """Substrings (case-insensitive) marking credits as own-money returns, from PNL_INCOME_EXCLUDE."""
+    raw = os.environ.get("PNL_INCOME_EXCLUDE", "")
+    return [s.strip().lower() for s in raw.split(",") if s.strip()]
+
+
 def _normalise_monzo(tx: dict) -> Optional[Transaction]:
-    # Primary signal: Monzo flags pot transfers, bank transfers, BACS credits
-    if not tx.get("include_in_spending", True):
-        return None
-    if tx.get("category", "") in ("pot_transfer", "transfers"):
-        return None
     amount_gbp = round(tx["amount"] / 100, 2)
     description = (tx.get("merchant") or {}).get("name") or tx.get("description", "")
+    if amount_gbp > 0:
+        # Monzo sets include_in_spending=False on ALL incoming credits, so that
+        # flag can't distinguish income from transfers — use category instead.
+        if tx.get("category", "") != "income":
+            return None
+        if any(p in description.lower() for p in _income_exclude_patterns()):
+            return None
+    else:
+        # Debits: Monzo flags pot transfers and bank transfers
+        if not tx.get("include_in_spending", True):
+            return None
+        if tx.get("category", "") in ("pot_transfer", "transfers"):
+            return None
     return Transaction(source="monzo", amount_gbp=amount_gbp, description=description, raw=tx)
 
 
