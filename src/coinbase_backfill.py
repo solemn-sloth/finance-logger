@@ -194,7 +194,21 @@ def _v2_tx_to_rows(tx: dict, trades: dict[str, list]) -> list[Row]:
         return []
 
     if ttype == "buy" or ttype == "sell":
-        gbp, method = _native_gbp(tx, dt)
+        # The embedded buy/sell sub-object itemises subtotal/fee/total in GBP.
+        # native_amount is the post-fee total (= subtotal + fee on a buy,
+        # subtotal - fee on a sell), so gains are identical either way; using
+        # subtotal + explicit fee keeps gross proceeds/cost visible on the row.
+        sub = tx.get(ttype) or {}
+        subtotal, fee = sub.get("subtotal") or {}, sub.get("fee") or {}
+        if subtotal.get("currency") == "GBP" and _dec(subtotal.get("amount")):
+            gbp = abs(_dec(subtotal["amount"]))
+            method = f"Coinbase {ttype} subtotal (GBP)"
+            fee_gbp = (abs(_dec(fee["amount"]))
+                       if fee.get("currency") == "GBP" and _dec(fee.get("amount"))
+                       else None)
+        else:
+            gbp, method = _native_gbp(tx, dt)
+            fee_gbp = None
         side = "BUY" if ttype == "buy" else "SELL"
         return [Row(
             idx=0, dt=dt, type=side,
@@ -202,7 +216,7 @@ def _v2_tx_to_rows(tx: dict, trades: dict[str, list]) -> list[Row]:
             qty_out=abs(qty) if side == "SELL" else None,
             asset_in=asset if side == "BUY" else "",
             qty_in=abs(qty) if side == "BUY" else None,
-            value_gbp=gbp, method=method, fee_gbp=None, fee_orig="",
+            value_gbp=gbp, method=method, fee_gbp=fee_gbp, fee_orig="",
             wallet="Coinbase", txid=txid, income_taxed=None,
             notes=tx.get("details", {}).get("title", "") or f"Coinbase {ttype}",
         )]
@@ -303,8 +317,12 @@ def _fill_to_row(f: dict) -> Row | None:
             notes=f"Advanced Trade {f['product_id']}",
         )
 
-    # crypto-crypto product = SWAP; value the quote side via Kraken OHLC
+    # crypto-crypto product = SWAP; value the quote side via Kraken OHLC.
+    # Commission is charged in the quote currency, same as fiat fills.
     gbp, fx = kraken.get_gbp_value(quote, quote_qty, dt.date())
+    fee_gbp = (kraken.get_gbp_value(quote, commission, dt.date())[0]
+               if commission else Decimal(0))
+    fee_orig = f"{commission.normalize():f} {quote}" if commission else ""
     if side == "BUY":
         out_a, out_q, in_a, in_q = quote, quote_qty, base, base_qty
     else:
@@ -313,7 +331,7 @@ def _fill_to_row(f: dict) -> Row | None:
         idx=0, dt=dt, type="SWAP",
         asset_out=out_a, qty_out=out_q, asset_in=in_a, qty_in=in_q,
         value_gbp=gbp, method=f"Coinbase fill; quote side: {fx}",
-        fee_gbp=None, fee_orig="",
+        fee_gbp=fee_gbp if fee_gbp else None, fee_orig=fee_orig,
         wallet="Coinbase", txid=txid, income_taxed=None,
         notes=f"Advanced Trade {f['product_id']}",
     )

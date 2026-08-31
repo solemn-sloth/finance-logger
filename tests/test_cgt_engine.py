@@ -274,19 +274,44 @@ def test_build_summary_block_layout():
     assert len(block) == SUMMARY_BLOCK_HEIGHT
     assert block[0] == [SUMMARY_MARKER, "", ""]   # no 'Last updated' timestamp
     assert block[1] == ["Tax year", "2026/27"]
-    assert block[2] == ["Disposals", 1]
-    assert isinstance(block[3][1], float) and block[3][1] == 3000.0   # proceeds
-    assert block[13][1] == "NO"                                       # >50k flag
-    labels = [r[0] for r in block[1:]]
-    assert labels == [
-        "Tax year", "Disposals", "Total proceeds", "Total gains", "Total losses",
-        "Net gain/loss", "Losses b/f available", "Losses b/f used",
-        "Annual exempt amount", "Taxable gain (after losses + AEA)",
-        "Estimated CGT due (basic rate, est.)",
-        "Losses carried forward", "Proceeds > £50k (report even if no tax due)",
-        "Reward income (declare as income)",
-        "RSU/share vest income (already payroll-taxed)",
-    ], labels
+    by_label = {r[0]: r[1:] for r in block[1:]}
+    # test wallet "test" is not a share wallet → everything lands in crypto
+    assert by_label["Box 14  Number of disposals"] == [1]
+    assert by_label["Box 15  Disposal proceeds"] == [3000.0]
+    assert by_label["Box 16  Allowable costs (incl. purchase price + fees)"] == [1000.0]
+    assert by_label["Box 17  Gains in the year, before losses"] == [2000.0]
+    assert by_label["Box 31  Number of disposals"] == [0]   # no share disposals
+    # gain 2000 < 3000 AEA and proceeds < £50k and no loss → no SA108 needed
+    assert by_label[
+        "Need to file SA108? (gains>AEA / proceeds>£50k / loss to claim)"] == ["NO"]
+    # section banner rows carry no per-year values
+    assert ["SA108 — Losses and adjustments"] in block
+
+
+def test_summary_class_split_and_costs():
+    # crypto SELL at a loss (with sell fee) + share SELL at a gain: each must
+    # land in its own SA108 section; allowable costs = basis + sell fee;
+    # losses reported positive; net loss in year → must file to claim it.
+    rows = [
+        row("2026-04-06T00:00", "OPENING", in_a="BTC", in_q="1", value="1000"),
+        row("2026-04-06T00:00", "OPENING", in_a="WISE", in_q="10", value="500"),
+        row("2026-06-01T10:00", "SELL", out_a="BTC", out_q="1", value="800", fee="10"),
+        row("2026-06-02T10:00", "SELL", out_a="WISE", out_q="10", value="600"),
+    ]
+    rows[1].wallet = rows[3].wallet = "Wise RSU"
+    y = _years(rows)[-1]
+    assert y.crypto.disposals == 1 and y.shares.disposals == 1
+    assert y.crypto.proceeds == Decimal("800")
+    assert y.crypto.costs == Decimal("1010")       # 1000 basis + 10 sell fee
+    assert y.crypto.losses == Decimal("210")       # positive, per the form
+    assert y.crypto.gains == Decimal("0")
+    assert y.shares.proceeds == Decimal("600")
+    assert y.shares.costs == Decimal("500")
+    assert y.shares.gains == Decimal("100")
+    assert y.shares.losses == Decimal("0")
+    # aggregates unchanged: net = -210 + 100
+    assert y.net == Decimal("-110")
+    assert y.must_file   # net loss → file SA108 to register the loss
 
 
 def test_vest_basis_matches_reward():
@@ -450,6 +475,84 @@ def test_backfill_history_collapses_and_reproduces_gain():
     sell = next(c[r.idx] for r in built if r.type == "SELL")
     assert sell.gain == Decimal("300"), sell.gain               # 600 - 400*150/200
     assert pools["XRP"] == (Decimal("50"), Decimal("100")), pools["XRP"]
+
+
+def test_coinbase_v2_sell_itemises_fee():
+    # native_amount is the post-fee total; subtotal/fee must be split out so
+    # gross proceeds land in Value and the engine nets to the same total.
+    import coinbase_backfill
+    tx = {
+        "id": "t1", "type": "sell", "status": "completed",
+        "created_at": "2025-01-10T12:00:00Z",
+        "amount": {"amount": "-0.5", "currency": "ATOM"},
+        "native_amount": {"amount": "-0.33", "currency": "GBP"},
+        "sell": {"subtotal": {"amount": "0.66", "currency": "GBP"},
+                 "fee": {"amount": "0.33", "currency": "GBP"},
+                 "total": {"amount": "0.33", "currency": "GBP"}},
+    }
+    (r,) = coinbase_backfill._v2_tx_to_rows(tx, {})
+    assert r.type == "SELL" and r.value_gbp == Decimal("0.66"), r
+    assert r.fee_gbp == Decimal("0.33"), r.fee_gbp
+    r.idx = 1
+    c, _ = compute_cgt([
+        row("2024-01-01T00:00", "OPENING", in_a="ATOM", in_q="0.5", value="0.10"),
+        r,
+    ])
+    assert c[1].gain == Decimal("0.23"), c[1].gain  # (0.66 - 0.33) - 0.10
+
+
+def test_coinbase_v2_buy_itemises_fee():
+    import coinbase_backfill
+    tx = {
+        "id": "t2", "type": "buy", "status": "completed",
+        "created_at": "2025-01-10T12:00:00Z",
+        "amount": {"amount": "100000", "currency": "SHIB"},
+        "native_amount": {"amount": "5.00", "currency": "GBP"},
+        "buy": {"subtotal": {"amount": "4.01", "currency": "GBP"},
+                "fee": {"amount": "0.99", "currency": "GBP"},
+                "total": {"amount": "5.00", "currency": "GBP"}},
+    }
+    (r,) = coinbase_backfill._v2_tx_to_rows(tx, {})
+    assert r.type == "BUY" and r.value_gbp == Decimal("4.01"), r
+    assert r.fee_gbp == Decimal("0.99"), r.fee_gbp
+    # engine cost = subtotal + fee = the 5.00 the user actually paid
+    r.idx = 1
+    _, pools = compute_cgt([r])
+    assert pools["SHIB"] == (Decimal("100000"), Decimal("5.00")), pools["SHIB"]
+
+
+def test_coinbase_v2_buy_no_fee_falls_back_to_native():
+    # most retail buys/sells have no explicit fee (spread only): native path
+    import coinbase_backfill
+    tx = {
+        "id": "t3", "type": "buy", "status": "completed",
+        "created_at": "2025-01-10T12:00:00Z",
+        "amount": {"amount": "95", "currency": "ATOM"},
+        "native_amount": {"amount": "500.00", "currency": "GBP"},
+        "buy": {"subtotal": {"amount": "500.00", "currency": "GBP"},
+                "total": {"amount": "500.00", "currency": "GBP"}},
+    }
+    (r,) = coinbase_backfill._v2_tx_to_rows(tx, {})
+    assert r.value_gbp == Decimal("500.00") and r.fee_gbp is None, r
+
+
+def test_coinbase_at_swap_captures_commission():
+    import coinbase_backfill
+    import kraken
+    orig = kraken.get_gbp_value
+    kraken.get_gbp_value = lambda asset, qty, d: (qty * 2, f"stub {asset}@2")
+    try:
+        r = coinbase_backfill._fill_to_row({
+            "entry_id": "f1", "product_id": "ETH-BTC", "side": "SELL",
+            "trade_time": "2025-01-10T12:00:00Z",
+            "price": "0.05", "size": "1", "size_in_quote": False,
+            "commission": "0.0005",
+        })
+    finally:
+        kraken.get_gbp_value = orig
+    assert r.type == "SWAP", r
+    assert r.fee_gbp == Decimal("0.001"), r.fee_gbp   # 0.0005 BTC @ stub 2
+    assert r.fee_orig == "0.0005 BTC", r.fee_orig
 
 
 if __name__ == "__main__":

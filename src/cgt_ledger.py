@@ -19,8 +19,10 @@ Layout — everything lives on the one tab:
   row D+1          blank spacer (formatted like a data row — the template that
                    inserted rows inherit their formatting from)
   row D+2          'CGT SUMMARY' marker row
-  next 13 rows     summary block: labels in column A, one column per tax year,
-                   including the loss carry-forward chain across years
+  next 25 rows     summary block: one row per SA108/SA100 return box (crypto
+                   and listed-shares sections split per the form), labels in
+                   column A, one column per tax year, including the loss
+                   carry-forward chain across years
 Rows below the block are never touched.
 
 Usage:
@@ -75,6 +77,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import os
 
 import sheets
+import notify
 
 LONDON = ZoneInfo("Europe/London")
 UTC = timezone.utc
@@ -104,6 +107,19 @@ KNOWN_TYPES = DISPOSAL_TYPES | ACQUISITION_TYPES | {"TRANSFER_IN", "TRANSFER_OUT
 # Kept in the data (pool cost, matching and dedupe correctness) but hidden
 # from view by the tab's basic filter — bookkeeping noise, not decisions.
 HIDDEN_ROW_TYPES = ["REWARD", "TRANSFER_IN", "TRANSFER_OUT"]
+
+# SA108 splits disposals by asset class into separate sections (Cryptoassets
+# page CG2 vs Listed shares page CG3); the ledger's wallet column is the
+# classifier. Wallets listed here are listed-shares venues; everything else
+# (Kraken, Coinbase, self-custody, ...) is a cryptoasset.
+SHARE_WALLETS = {
+    w.strip() for w in os.environ.get(
+        "CGT_SHARE_WALLETS", "T212-Invest,Wise RSU").split(",") if w.strip()
+}
+
+
+def _asset_class(r: "Row") -> str:
+    return "shares" if r.wallet in SHARE_WALLETS else "crypto"
 
 
 # ---------------------------------------------------------------------------
@@ -996,7 +1012,7 @@ def reconcile_holdings(
 # ---------------------------------------------------------------------------
 
 SUMMARY_MARKER = "CGT SUMMARY"
-SUMMARY_BLOCK_HEIGHT = 16
+SUMMARY_BLOCK_HEIGHT = 26  # marker row + len(_summary_spec(...)) rows
 
 
 def read_ledger(sheet_id: str, tab: str) -> tuple[list[Row], int | None]:
@@ -1124,6 +1140,16 @@ def cgt_rate_for(year: int, higher_rate: bool) -> Decimal:
 
 
 @dataclass
+class ClassTotals:
+    """One SA108 section's totals (Cryptoassets or Listed shares)."""
+    disposals: int = 0
+    proceeds: Decimal = Decimal(0)   # gross consideration (box 15/32)
+    costs: Decimal = Decimal(0)      # allowable costs incl fees (box 16/33)
+    gains: Decimal = Decimal(0)      # gains before losses (box 17/34)
+    losses: Decimal = Decimal(0)     # losses in the year, positive (box 19/35)
+
+
+@dataclass
 class YearSummary:
     year: int                 # tax year starting 6 April `year`
     disposals: int
@@ -1139,6 +1165,16 @@ class YearSummary:
     losses_cf: Decimal        # carried into the next year
     reward_income: Decimal    # staking/misc rewards — declarable income
     vest_income: Decimal      # RSU/share vests — already taxed via payroll
+    crypto: ClassTotals = field(default_factory=ClassTotals)
+    shares: ClassTotals = field(default_factory=ClassTotals)
+
+    @property
+    def must_file(self) -> bool:
+        """SA108 needed: total gains above the AEA, proceeds above the £50k
+        reporting threshold, or a net loss to register for carry-forward."""
+        return (self.gains > self.aea
+                or self.proceeds > PROCEEDS_REPORTING_THRESHOLD
+                or self.net < 0)
 
 
 def summarise_years(rows: list[Row], computed: dict[int, Computed],
@@ -1175,6 +1211,21 @@ def summarise_years(rows: list[Row], computed: dict[int, Computed],
         losses = sum((computed[r.idx].gain for r in disposals
                       if computed[r.idx].gain and computed[r.idx].gain < 0), Decimal(0))
         net = gains + losses
+        # Per-SA108-section totals. Allowable costs = proceeds − gain per
+        # disposal, i.e. acquisition cost + the sell fee (the engine's proceeds
+        # are net of fee: gain = (value − fee) − cost, so value − gain = cost + fee).
+        by_class = {"crypto": ClassTotals(), "shares": ClassTotals()}
+        for r in disposals:
+            t = by_class[_asset_class(r)]
+            g = computed[r.idx].gain or Decimal(0)
+            v = r.value_gbp or Decimal(0)
+            t.disposals += 1
+            t.proceeds += v
+            t.costs += v - g
+            if g > 0:
+                t.gains += g
+            else:
+                t.losses += -g
         aea = aea_for(year)
         if net > 0:
             bf_used = min(pool, max(Decimal(0), net - aea))
@@ -1198,40 +1249,74 @@ def summarise_years(rows: list[Row], computed: dict[int, Computed],
         tax_due = (taxable * cgt_rate_for(year, higher_rate)).quantize(Decimal("0.01"))
         out.append(YearSummary(year, len(disposals), proceeds, gains, losses, net,
                                pool, bf_used, aea, taxable, tax_due, cf,
-                               reward_income, vest_income))
+                               reward_income, vest_income,
+                               crypto=by_class["crypto"], shares=by_class["shares"]))
         pool = cf
     return out
 
 
+def _summary_spec(band_label: str = "basic rate") -> list[tuple]:
+    """(label, kind, per-year getter) rows of the summary block, in sheet
+    order. Kinds drive both the value type and the styling: 'year' (header),
+    'section' (SA108/SA100 section banner, no values), 'count' (integer),
+    'gbp' (currency), 'flag' (YES/NO). Box numbers verified against the
+    official SA108 2025 + 2026 forms (identical numbering both years)."""
+    def sec(label):
+        return (label, "section", None)
+    return [
+        ("Tax year", "year", lambda y: tax_year_label(y.year)),
+        sec("SA108 — Cryptoassets (page CG2; section exists 2024/25 on)"),
+        ("Box 14  Number of disposals", "count", lambda y: y.crypto.disposals),
+        ("Box 15  Disposal proceeds", "gbp", lambda y: y.crypto.proceeds),
+        ("Box 16  Allowable costs (incl. purchase price + fees)", "gbp",
+         lambda y: y.crypto.costs),
+        ("Box 17  Gains in the year, before losses", "gbp", lambda y: y.crypto.gains),
+        ("Box 19  Losses in the year", "gbp", lambda y: y.crypto.losses),
+        sec("SA108 — Listed shares and securities (page CG3)"),
+        ("Box 31  Number of disposals", "count", lambda y: y.shares.disposals),
+        ("Box 32  Disposal proceeds", "gbp", lambda y: y.shares.proceeds),
+        ("Box 33  Allowable costs (incl. purchase price + fees)", "gbp",
+         lambda y: y.shares.costs),
+        ("Box 34  Gains in the year, before losses", "gbp", lambda y: y.shares.gains),
+        ("Box 35  Losses in the year", "gbp", lambda y: y.shares.losses),
+        sec("SA108 — Losses and adjustments"),
+        ("Box 45  Losses brought forward and used in-year", "gbp",
+         lambda y: y.losses_bf_used),
+        ("Box 47  Losses available to be carried forward", "gbp",
+         lambda y: y.losses_cf),
+        sec("SA100 — Income (page TR3)"),
+        ("Box 17  Other taxable income — staking/reward income", "gbp",
+         lambda y: y.reward_income),
+        sec("Info only — NOT return boxes"),
+        ("Need to file SA108? (gains>AEA / proceeds>£50k / loss to claim)",
+         "flag", lambda y: "YES" if y.must_file else "NO"),
+        ("Net gain/loss (all sections)", "gbp", lambda y: y.net),
+        ("Annual exempt amount", "gbp", lambda y: y.aea),
+        ("Taxable gain (net − losses b/f − AEA)", "gbp", lambda y: y.taxable),
+        (f"Estimated CGT due ({band_label}, est.)", "gbp", lambda y: y.tax_due),
+        ("RSU vest income — already payroll-taxed, do NOT re-declare", "gbp",
+         lambda y: y.vest_income),
+    ]
+
+
 def build_summary_block(years: list[YearSummary],
                         band_label: str = "basic rate") -> list[list]:
-    """The 16-row summary block (marker row included): labels in column A,
-    one column per tax year. Numeric cells are numbers, never strings."""
-    def per(fn):
-        return [fn(y) for y in years]
-    return [
-        # B and C written empty on purpose: they used to carry a "Last updated"
-        # timestamp the user removed, and blanks here clear it rather than
-        # leaving the stale text behind.
-        [SUMMARY_MARKER, "", ""],
-        ["Tax year"] + per(lambda y: tax_year_label(y.year)),
-        ["Disposals"] + per(lambda y: y.disposals),
-        ["Total proceeds"] + per(lambda y: _num(y.proceeds)),
-        ["Total gains"] + per(lambda y: _num(y.gains)),
-        ["Total losses"] + per(lambda y: _num(y.losses)),
-        ["Net gain/loss"] + per(lambda y: _num(y.net)),
-        ["Losses b/f available"] + per(lambda y: _num(y.losses_bf)),
-        ["Losses b/f used"] + per(lambda y: _num(y.losses_bf_used)),
-        ["Annual exempt amount"] + per(lambda y: _num(y.aea)),
-        ["Taxable gain (after losses + AEA)"] + per(lambda y: _num(y.taxable)),
-        [f"Estimated CGT due ({band_label}, est.)"] + per(lambda y: _num(y.tax_due)),
-        ["Losses carried forward"] + per(lambda y: _num(y.losses_cf)),
-        ["Proceeds > £50k (report even if no tax due)"]
-        + per(lambda y: "YES" if y.proceeds > PROCEEDS_REPORTING_THRESHOLD else "NO"),
-        ["Reward income (declare as income)"] + per(lambda y: _num(y.reward_income)),
-        ["RSU/share vest income (already payroll-taxed)"]
-        + per(lambda y: _num(y.vest_income)),
-    ]
+    """The summary block (marker row included): labels in column A, one column
+    per tax year, one row per SA108/SA100 box (see _summary_spec). Numeric
+    cells are numbers, never strings."""
+    # marker row: B and C written empty on purpose — they used to carry a
+    # "Last updated" timestamp the user removed, and blanks here clear it
+    # rather than leaving the stale text behind.
+    block = [[SUMMARY_MARKER, "", ""]]
+    for label, kind, get in _summary_spec(band_label):
+        if kind == "section":
+            block.append([label])
+        elif kind == "gbp":
+            block.append([label] + [_num(get(y)) for y in years])
+        else:  # year / count / flag: verbatim values
+            block.append([label] + [get(y) for y in years])
+    assert len(block) == SUMMARY_BLOCK_HEIGHT, len(block)
+    return block
 
 
 # --- Conditional formatting (re-pinned idempotently every run) --------------
@@ -1336,36 +1421,37 @@ def write_summary(sheet_id: str, tab: str, marker_row: int,
         return
     m0 = marker_row - 1  # 0-based
     ncols = 1 + len(years)
+    width = max(ncols, 3)  # min 3 cols: the cleared legacy "Last updated" cells
     bold = {"textFormat": {"bold": True}}
-    sheets.apply_formats(sheet_id, tab, [
-        # banner: bold + grey fill across the block width (min 3 cols for the
-        # "Last updated" cells)
-        ({"startRowIndex": m0, "endRowIndex": m0 + 1,
-          "startColumnIndex": 0, "endColumnIndex": max(ncols, 3)},
-         {**bold, "backgroundColor": _SUMMARY_FILL},
+
+    def row_range(i, c0=1, c1=None):  # i = 0-based offset within the block
+        return {"startRowIndex": m0 + i, "endRowIndex": m0 + i + 1,
+                "startColumnIndex": c0, "endColumnIndex": c1 or ncols}
+
+    formats = [
+        # banner: bold + grey fill across the block width
+        (row_range(0, 0, width), {**bold, "backgroundColor": _SUMMARY_FILL},
          "userEnteredFormat(textFormat.bold,backgroundColor)"),
         # label column
         ({"startRowIndex": m0 + 1, "endRowIndex": m0 + SUMMARY_BLOCK_HEIGHT,
           "startColumnIndex": 0, "endColumnIndex": 1},
          bold, "userEnteredFormat.textFormat.bold"),
-        # year header row
-        ({"startRowIndex": m0 + 1, "endRowIndex": m0 + 2,
-          "startColumnIndex": 1, "endColumnIndex": ncols},
-         bold, "userEnteredFormat.textFormat.bold"),
-        # Disposals: plain integers
-        ({"startRowIndex": m0 + 2, "endRowIndex": m0 + 3,
-          "startColumnIndex": 1, "endColumnIndex": ncols},
-         {"numberFormat": {"type": "NUMBER", "pattern": "0"}},
-         "userEnteredFormat.numberFormat"),
-        # currency: Total proceeds .. Losses carried forward (incl. est. CGT due)
-        ({"startRowIndex": m0 + 3, "endRowIndex": m0 + 13,
-          "startColumnIndex": 1, "endColumnIndex": ncols},
-         _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
-        # currency: Reward income + RSU vest income
-        ({"startRowIndex": m0 + 14, "endRowIndex": m0 + SUMMARY_BLOCK_HEIGHT,
-          "startColumnIndex": 1, "endColumnIndex": ncols},
-         _CURRENCY_FMT, "userEnteredFormat.numberFormat"),
-    ])
+    ]
+    for i, (_, kind, _get) in enumerate(_summary_spec(band_label), start=1):
+        if kind == "year":
+            formats.append((row_range(i), bold, "userEnteredFormat.textFormat.bold"))
+        elif kind == "section":
+            formats.append((row_range(i, 0, width),
+                            {**bold, "backgroundColor": _SUMMARY_FILL},
+                            "userEnteredFormat(textFormat.bold,backgroundColor)"))
+        elif kind == "count":
+            formats.append((row_range(i),
+                            {"numberFormat": {"type": "NUMBER", "pattern": "0"}},
+                            "userEnteredFormat.numberFormat"))
+        elif kind == "gbp":
+            formats.append((row_range(i), _CURRENCY_FMT,
+                            "userEnteredFormat.numberFormat"))
+    sheets.apply_formats(sheet_id, tab, formats)
 
 
 HOLDINGS_MARKER = "CURRENT HOLDINGS"
@@ -1501,7 +1587,7 @@ def setup_tab(sheet_id: str, tab: str, losses_bf: Decimal) -> None:
 def _print_summary(years: list[YearSummary], band_label: str = "basic rate") -> None:
     block = build_summary_block(years, band_label)
     for line in block[1:]:
-        print("  " + str(line[0]).ljust(44)
+        print("  " + str(line[0]).ljust(62)
               + "  ".join(f"{v!s:>12}" for v in line[1:]))
 
 
@@ -1711,4 +1797,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        try:
+            notify.send_alert("cgt_ledger failed", str(e))
+        except Exception as notify_err:
+            print(f"ALSO FAILED to send alert: {notify_err}", file=sys.stderr)
+        sys.exit(1)
