@@ -1,7 +1,7 @@
 """
-Failure alert — reuses the Gmail app password already configured for
-Barclaycard IMAP (config/.env: IMAP_USER / IMAP_APP_PASSWORD) to send
-a plain SMTP email to yourself when a cron job dies.
+Failure alert — plain SMTP email to yourself when a cron job dies,
+using the Gmail app password in config/.env (IMAP_USER / IMAP_APP_PASSWORD;
+names kept from the retired Barclaycard IMAP setup).
 """
 
 import os
